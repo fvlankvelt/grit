@@ -36,6 +36,14 @@ RocksDB lets us use an Iterator (`db->NewIterator(readOptions)`).
 * time-range: by also setting `ReadOptions#iter_start_ts`, also older entries can be read.
 
 
+Slices
+===
+
+When there is a lot of churn on a vertex or an index entry, there are many keys that need to be iterated over (implicitly) that have been deleted.  They will remain present until they fall out of the retention window.  This makes reading vertices slow.  A way to mitigate this is by "slicing".  When the number of deletes is large both in absolute terms (say, #deleted-keys > 10) and relative (#deleted-keys > #non-deleted-keys), a new "slice" of the data can be made.  Keys that are present (i.e. have not been deleted) in the "live slice" are moved over.  The keys are deleted in the "old slice" and are added to the "new slice".
+
+This mechanism lets compaction clean up the expired slices automatically.  Old slices should only be read with a timestamp before their archiving (or they appear empty).
+
+
 Other things to consider:
 
 * *Compaction*: RocksDB compaction lets us specify a user-defined timestamp.  Values older than that will be deleted if they're no longer visible.

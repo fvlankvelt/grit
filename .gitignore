@@ -1,1 +1,4 @@
 build/
+*.pb.cc
+*.pb.h
+.vscode/

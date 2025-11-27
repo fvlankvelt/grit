@@ -1,0 +1,17 @@
+edition = "2023";
+
+package storage;
+
+/**
+ * Field order also determines key sorting.
+ * Keys are sorted bytewise, which should work out fine for protobuf since fields are serialized sequentially.
+ */
+message VertexKey {
+    string type = 1;
+    int64 id = 2;
+}
+
+message IndexKey {
+    string label = 1;
+    VertexKey vertex = 2;
+}

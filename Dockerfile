@@ -11,10 +11,11 @@ RUN zypper update -y \
     libbz2-devel \
     liblz4-devel \
     libzstd-devel \
+    protobuf-devel \
  && touch /usr/lib64/librocksdb.a
 
-WORKDIR /src/
 COPY . /src/
+WORKDIR /src/
 RUN cmake -B /build
 RUN cmake --build /build
 

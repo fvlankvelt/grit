@@ -15,3 +15,33 @@ message IndexKey {
     string label = 1;
     VertexKey vertex = 2;
 }
+
+enum Direction {
+    IN = 0;
+    OUT = 1;
+}
+
+message EdgeKey {
+    VertexKey vertex = 1;
+    string label = 2;
+    Direction direction = 3;
+    VertexKey other = 4;
+}
+
+/**
+ * Querying prefixes
+ */
+message VertexByType {
+    string type = 1;
+}
+
+message IndexVertexByType {
+    string label = 1;
+    VertexByType vertexByType = 2;
+}
+
+message EdgeByLabel {
+    VertexKey vertex = 1;
+    string label = 2;
+    Direction direction = 3;
+}

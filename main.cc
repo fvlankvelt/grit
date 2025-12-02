@@ -3,13 +3,248 @@
 #include <memory>
 #include <sstream>
 
+#include "rocksdb/compaction_filter.h"
 #include "rocksdb/db.h"
+#include "rocksdb/merge_operator.h"
 #include "storage.pb.h"
+
+#define MAX_N_OPERANDS 100
+
+enum TransactionException { TX_IS_READONLY, TX_CONFLICT, TX_INVALIDATED, TX_NOT_IN_PROGRESS };
 
 struct VertexId {
     std::string type;
     long id;
 };
+
+constexpr bool operator<(const VertexId& a, const VertexId& b) {
+    int cmp = a.type.compare(b.type);
+    return cmp == 0 ? a.id < b.id : cmp < 0;
+}
+
+class Transaction {
+   public:
+    Transaction(
+        uint64_t txId, std::set<uint64_t> inProgress, std::set<uint64_t> invalid, bool readOnly)
+        : txId(txId), inProgress(inProgress), invalidTxIds(invalid), readOnly(readOnly) {
+        fluidTxId = txId;
+        for (auto it = inProgress.begin(); it != inProgress.end(); it++) {
+            if (*it < fluidTxId) {
+                fluidTxId = *it;
+            }
+        }
+    }
+
+    void Touch(const VertexId& key) {
+        if (readOnly) {
+            throw TX_IS_READONLY;
+        }
+        touched.insert(key);
+    }
+
+    uint64_t GetTxId() const { return txId; }
+
+    uint64_t GetFluidTxId() const { return fluidTxId; }
+
+    bool IsExcluded(uint64_t otherTxId) const {
+        return otherTxId > txId || inProgress.find(otherTxId) != inProgress.end() ||
+               invalidTxIds.find(otherTxId) != invalidTxIds.end();
+    }
+
+    friend class TransactionManager;
+
+   private:
+    // last transaction that can be read
+    uint64_t txId;
+    // start of in-progress transaction window, there are no in-progress txns before it.
+    uint64_t fluidTxId;
+
+    bool readOnly;
+    std::set<uint64_t> inProgress;
+    std::set<uint64_t> invalidTxIds;
+    std::set<VertexId> touched;
+};
+
+class TransactionManager {
+   public:
+    std::shared_ptr<Transaction> Open() {
+        uint64_t txId = ++lastTxId;
+        inProgress.insert(txId);
+        return std::shared_ptr<Transaction>(new Transaction(txId, inProgress, invalid, false));
+    }
+
+    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) {
+        uint64_t tx = txId == -1 ? ++lastTxId : txId;
+        return std::shared_ptr<Transaction>(new Transaction(tx, inProgress, invalid, true));
+    }
+
+    void Commit(const Transaction& txn) {
+        uint64_t txId = txn.GetTxId();
+        if (inProgress.find(txId) == inProgress.end()) {
+            throw TX_NOT_IN_PROGRESS;
+        }
+
+        try {
+            // validate txn against all transactions from its in-progress set
+            // that have been committed since its start.
+            for (auto it = txn.inProgress.begin(); it != txn.inProgress.end(); it++) {
+                uint64_t inPTxId = *it;
+                if (inProgress.find(inPTxId) != inProgress.end() ||
+                    invalid.find(inPTxId) != invalid.end()) {
+                    continue;
+                }
+                if (recent.find(inPTxId) == recent.end()) {
+                    // transaction references a committed transaction, but that has
+                    // expired already.  So we cannot check if it conflicts.
+                    throw TX_INVALIDATED;
+                } else {
+                    const std::set<VertexId> ref = recent.find(inPTxId)->second;
+                    if (Conflict(ref, txn.touched)) {
+                        throw TX_CONFLICT;
+                    }
+                }
+            }
+
+            // similar for transactions that started later, but that have already
+            // been committed.
+            for (auto it = recent.begin(); it != recent.end(); it++) {
+                if (it->first > txId && Conflict(it->second, txn.touched)) {
+                    throw TX_CONFLICT;
+                }
+            }
+        } catch (TransactionException te) {
+            inProgress.erase(txId);
+            invalid.insert(txId);
+            throw te;
+        }
+
+        // hurray!  No conflicts detected
+        recent.insert(std::pair(txId, txn.touched));
+        inProgress.erase(txId);
+    }
+
+    void Rollback(uint64_t txId) {
+        inProgress.erase(txId);
+        invalid.insert(txId);
+    }
+
+    /**
+     * Remove from memory all committed transactions from before expireTx.
+     * This will abort any transactions that started before expireTx.
+     */
+    void Advance(uint64_t expireTx) {
+        for (auto it = recent.begin(); it != recent.end();) {
+            uint64_t txId = it->first;
+            if (txId < expireTx) {
+                it = recent.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    bool IsInvalid(uint64_t txId) const { return invalid.find(txId) != invalid.end(); }
+
+   private:
+    bool Conflict(const std::set<VertexId>& a, const std::set<VertexId>& b) {
+        std::set<VertexId> out;
+        std::set_intersection(
+            a.begin(), a.end(), b.begin(), b.end(), std::inserter(out, out.begin()));
+        return out.begin() != out.end();
+    }
+
+    uint64_t lastTxId = 0;
+    std::map<uint64_t, std::set<VertexId>> recent;
+    std::set<uint64_t> inProgress;
+
+    // all rolled back and invalidated transactions - this set can be pruned
+    // by a scan (GC) over all data; any updates from invalidated txns are removed
+    // on a compaction.
+    std::set<uint64_t> invalid;
+};
+
+/**
+ * Merge updates to a key, filtering out those created by invalid transactions.
+ * Should only be used on time ranges that exclude the "active window" as in-progress
+ * transactions are still undecided.
+ */
+/*
+class TxMergeOperator : public rocksdb::MergeOperator {
+   public:
+    TxMergeOperator(TransactionManager& txMgr) : txMgr(txMgr) {}
+
+    const char* Name() const { return "TxMergeOperator"; }
+
+    bool FullMergeV2(
+        const MergeOperationInput& merge_in, MergeOperationOutput* merge_out) const override {
+        merge_out->new_value = merge_in.existing_value->ToStringView();
+        for (auto it = merge_in.operand_list.begin(); it != merge_in.operand_list.end(); it++) {
+            storage::MergeValue value;
+            value.ParseFromString(it->ToStringView());
+
+            if (!txMgr.IsInvalid(value.txid())) {
+                merge_out->new_value = it->data();
+                break;
+            }
+        }
+        return true;
+    }
+
+   private:
+    TransactionManager& txMgr;
+};
+*/
+
+/*
+class TxCompactionFilter : public rocksdb::CompactionFilter {
+   public:
+    TxCompactionFilter(TransactionManager& txMgr) : txMgr(txMgr) {}
+
+    const char* Name() const { return "TxCompactionFilter"; }
+
+    // The table file creation process invokes this method before adding a kv to
+    // the table file. A return value of false indicates that the kv should be
+    // preserved in the new table file and a return value of true indicates
+    // that this key-value should be removed (that is, converted to a tombstone).
+    // The application can inspect the existing value of the key and make decision
+    // based on it.
+    //
+    // Key-Values that are results of merge operation during table file creation
+    // are not passed into this function. Currently, when you have a mix of Put()s
+    // and Merge()s on a same key, we only guarantee to process the merge operands
+    // through the `CompactionFilter`s. Put()s might be processed, or might not.
+    //
+    // When the value is to be preserved, the application has the option
+    // to modify the existing_value and pass it back through new_value.
+    // value_changed needs to be set to true in this case.
+    bool Filter(
+        int level,
+        const rocksdb::Slice& key,
+        const rocksdb::Slice& existing_value,
+        std::string* new_value,
+        bool* value_changed) const {
+        storage::MergeValue value;
+        value.ParseFromString(existing_value.ToStringView());
+
+        // what to do in this case?
+        assert(!txMgr.IsInvalid(value.txid()));
+        return value.action() == storage::DELETE;
+    }
+
+    // The table file creation process invokes this method on every merge operand.
+    // If this method returns true, the merge operand will be ignored and not
+    // written out in the new table file.
+    bool FilterMergeOperand(
+        int level, const rocksdb::Slice&  key , const rocksdb::Slice& operand) const {
+        storage::MergeValue value;
+        value.ParseFromString(operand.ToStringView());
+        return txMgr.IsInvalid(value.txid());
+    }
+
+   private:
+    TransactionManager& txMgr;
+};
+*/
 
 enum Direction { IN, OUT };
 
@@ -32,99 +267,181 @@ struct Storage {
 template <class T>
 class EntryIterator {
    public:
-    EntryIterator(rocksdb::Iterator* upstream, const std::string& prefix)
-        : upstream(upstream), prefixStr(prefix), prefix(prefixStr) {}
+    EntryIterator(
+        rocksdb::Iterator* fluid,   // time-range iterator that includes in-progress txn data
+                                    // (multiple updates per key)
+        rocksdb::Iterator* frozen,  // time-travel iterator that only contains historic data
+                                    // (one entry per key)
+        const std::string& prefix,
+        const std::shared_ptr<Transaction>& txn)
+        : fluid(fluid), frozen(frozen), prefixStr(prefix), prefix(prefixStr), txn(txn) {
+        comparator = rocksdb::BytewiseComparatorWithU64Ts();
+    }
 
     const T& Get() const { return current; }
 
-    bool Valid() const { return valid && upstream->Valid(); }
+    bool Valid() const { return valid; }
 
+    /**
+     * Proceed to next key.  Skip older updates to a key and updates from excluded transactions.
+     */
     void Next() {
-        upstream->Next();
-        Update();
-    }
-
-   protected:
-    virtual void populate() = 0;
-
-    void Update() {
-        if (upstream->Valid()) {
-            if (CheckValid()) {
-                populate();
+        bool foundKey = false;
+        while (!foundKey && ((fluid->Valid() && IsValidKey(fluid->key())) ||
+                             (frozen->Valid() && IsValidKey(frozen->key())))) {
+            int cmp;
+            if ((fluid->Valid() && IsValidKey(fluid->key())) &&
+                (frozen->Valid() && IsValidKey(frozen->key()))) {
+                cmp = comparator->CompareWithoutTimestamp(
+                    fluid->key(), true, frozen->key(), false);
+            } else if (fluid->Valid() && IsValidKey(fluid->key())) {
+                cmp = -1;
             } else {
-                valid = false;
+                cmp = +1;
             }
+
+            uint64_t keyTxId;
+            storage::MergeValue value;
+            if (cmp > 0) {
+                DecodeU64Ts(frozen->timestamp(), &keyTxId);
+                if (txn->IsExcluded(keyTxId)) {
+                    frozen->Next();
+                    continue;
+                }
+                currentKey = frozen->key().ToString();
+                assert(frozen->key().ToString().compare(currentKey) == 0);
+                value.ParseFromString(frozen->value().ToStringView());
+            } else {
+                DecodeU64Ts(fluid->timestamp(), &keyTxId);
+                if (txn->IsExcluded(keyTxId)) {
+                    fluid->Next();
+                    continue;
+                }
+                // time-range iterator includes user-defined timestamp in key
+                currentKey = FluidKey();
+                value.ParseFromString(fluid->value().ToStringView());
+            }
+
+            // skip deleted keys
+            if (value.action() == storage::PUT) {
+                populate(currentKey);
+                foundKey = true;
+            }
+
+            // skip all remaining entries for the same key
+            while (fluid->Valid() && FluidKey().compare(currentKey) == 0) {
+                fluid->Next();
+            }
+            while (frozen->Valid() && frozen->key().ToString().compare(currentKey) == 0) {
+                frozen->Next();
+            }
+        }
+
+        if (!foundKey) {
+            valid = false;
         }
     }
 
-    bool CheckValid() const {
-        return upstream->key().starts_with(prefix);
+   protected:
+    virtual void populate(const rocksdb::Slice& keySlice) = 0;
+    virtual std::string ToString(T value) = 0;
+
+    bool valid = true;
+    T current;
+
+   private:
+    bool IsValidKey(const rocksdb::Slice& key) const { return key.starts_with(prefix); }
+
+    std::string FluidKey() const {
+        return std::string(fluid->key().data(), fluid->key().size() - 16);
     }
 
+    std::string currentKey;
+    const std::shared_ptr<Transaction> txn;
+    const rocksdb::Comparator* comparator;
     std::string prefixStr;
     rocksdb::Slice prefix;
-    bool valid;
-    T current;
-    std::unique_ptr<rocksdb::Iterator> upstream;
+    std::unique_ptr<rocksdb::Iterator> fluid;
+    std::unique_ptr<rocksdb::Iterator> frozen;
 };
 
 class VertexIterator : public EntryIterator<VertexId> {
    public:
-    VertexIterator(rocksdb::Iterator* upstream, const std::string& prefix)
-        : EntryIterator(upstream, prefix) {
-        upstream->Seek(prefix);
-        Update();
+    VertexIterator(
+        rocksdb::Iterator* fluid,
+        rocksdb::Iterator* frozen,
+        const std::string& prefix,
+        const std::shared_ptr<Transaction>& txn)
+        : EntryIterator(fluid, frozen, prefix, txn) {
+        fluid->Seek(prefix);
+        frozen->Seek(prefix);
+        Next();
     }
 
    protected:
-    void populate() {
-        assert(upstream->Valid());
-
+    void populate(const rocksdb::Slice& keySlice) {
         storage::VertexKey key;
-        key.ParseFromString(upstream->key().ToStringView());
+        key.ParseFromString(keySlice.ToStringView());
 
         current = VertexId{
             key.type(),
             key.id(),
         };
     }
+    std::string ToString(VertexId id) {
+        std::stringstream ss;
+        ss << id.type << ":" << id.id;
+        return ss.str();
+    }
 };
 
 class IndexVertexIterator : public EntryIterator<VertexId> {
    public:
-    IndexVertexIterator(rocksdb::Iterator* upstream, const std::string& prefix)
-        : EntryIterator(upstream, prefix) {
-        upstream->Seek(prefix);
-        Update();
+    IndexVertexIterator(
+        rocksdb::Iterator* fluid,
+        rocksdb::Iterator* frozen,
+        const std::string& prefix,
+        const std::shared_ptr<Transaction>& txn)
+        : EntryIterator(fluid, frozen, prefix, txn) {
+        fluid->Seek(prefix);
+        frozen->Seek(prefix);
+        Next();
     }
 
    protected:
-    void populate() {
-        assert(upstream->Valid());
-
+    void populate(const rocksdb::Slice& keySlice) {
         storage::IndexKey key;
-        key.ParseFromString(upstream->key().ToStringView());
+        key.ParseFromString(keySlice.ToStringView());
 
         current = VertexId{
             key.vertex().type(),
             key.vertex().id(),
         };
     }
+    std::string ToString(VertexId id) {
+        std::stringstream ss;
+        ss << id.type << ":" << id.id;
+        return ss.str();
+    }
 };
 
 class EdgeIterator : public EntryIterator<Edge> {
    public:
-    EdgeIterator(rocksdb::Iterator* upstream, const std::string& prefix)
-        : EntryIterator(upstream, prefix) {
-        upstream->Seek(prefix);
-        Update();
+    EdgeIterator(
+        rocksdb::Iterator* fluid,
+        rocksdb::Iterator* frozen,
+        const std::string& prefix,
+        const std::shared_ptr<Transaction>& txn)
+        : EntryIterator(fluid, frozen, prefix, txn) {
+        fluid->Seek(prefix);
+        frozen->Seek(prefix);
+        Next();
     }
 
    protected:
-    void populate() {
-        assert(upstream->Valid());
+    void populate(const rocksdb::Slice& keySlice) {
         storage::EdgeKey key;
-        key.ParseFromString(upstream->key().ToStringView());
+        key.ParseFromString(keySlice.ToStringView());
 
         current = Edge{
             VertexId{key.vertex().type(), key.vertex().id()},
@@ -132,14 +449,27 @@ class EdgeIterator : public EntryIterator<Edge> {
             key.label(),
             key.direction() == storage::Direction::IN ? IN : OUT};
     }
+    std::string ToString(Edge edge) {
+        std::stringstream ss;
+        ss << edge.direction << " " << edge.label << " " << edge.vertexId.id << " - "
+           << edge.otherId.id;
+        return ss.str();
+    }
 };
 
 class ReadTransaction {
    public:
-    ReadTransaction(const Storage& storage, long txId)
-        : storage(storage), tx(rocksdb::EncodeU64Ts(1, &str_ts)) {
-        readOptions.timestamp = &tx;
-        readOptions.total_order_seek = true;
+    ReadTransaction(const Storage& storage, const std::shared_ptr<Transaction>& txn)
+        : storage(storage),
+          txn(txn),
+          tx(rocksdb::EncodeU64Ts(txn->GetTxId(), &str_ts)),
+          start_tx(rocksdb::EncodeU64Ts(txn->GetFluidTxId(), &str_start_ts)) {
+        fluidReadOptions.timestamp = &tx;
+        fluidReadOptions.iter_start_ts = &start_tx;
+        fluidReadOptions.total_order_seek = true;
+
+        frozenReadOptions.timestamp = &start_tx;
+        frozenReadOptions.total_order_seek = true;
     }
 
     VertexIterator* GetVerticesByType(const std::string& type) {
@@ -152,7 +482,10 @@ class ReadTransaction {
         std::string trimmed = vbt.SerializeAsString();
 
         return new VertexIterator(
-            storage.db->NewIterator(readOptions, storage.vertices), firstKey.substr(0, trimmed.size()));
+            storage.db->NewIterator(fluidReadOptions, storage.vertices),
+            storage.db->NewIterator(frozenReadOptions, storage.vertices),
+            firstKey.substr(0, trimmed.size()),
+            txn);
     }
 
     IndexVertexIterator* GetVerticesByLabel(const std::string& label, const std::string& type) {
@@ -168,8 +501,10 @@ class ReadTransaction {
         std::string trimmed = ivbt.SerializeAsString();
 
         return new IndexVertexIterator(
-            storage.db->NewIterator(readOptions, storage.index),
-            firstKey.substr(0, trimmed.size()));
+            storage.db->NewIterator(fluidReadOptions, storage.index),
+            storage.db->NewIterator(frozenReadOptions, storage.index),
+            firstKey.substr(0, trimmed.size()),
+            txn);
     }
 
     EdgeIterator* GetEdges(
@@ -189,27 +524,42 @@ class ReadTransaction {
         std::string trimmed = ebl.SerializeAsString();
 
         return new EdgeIterator(
-            storage.db->NewIterator(readOptions, storage.edges),
-            firstKey.substr(0, trimmed.size()));
+            storage.db->NewIterator(fluidReadOptions, storage.edges),
+            storage.db->NewIterator(frozenReadOptions, storage.edges),
+            firstKey.substr(0, trimmed.size()),
+            txn);
     }
 
    protected:
-    rocksdb::ReadOptions readOptions;
+    rocksdb::ReadOptions fluidReadOptions;
+    rocksdb::ReadOptions frozenReadOptions;
+
     std::string str_ts;
     rocksdb::Slice tx;
+    std::string str_start_ts;
+    rocksdb::Slice start_tx;
+    std::shared_ptr<Transaction> txn;
     const Storage& storage;
 };
 
 class WriteTransaction : ReadTransaction {
    public:
-    WriteTransaction(const Storage& storage, long txId) : ReadTransaction(storage, txId) {}
+    WriteTransaction(const Storage& storage, TransactionManager& txMgr)
+        : ReadTransaction(storage, txMgr.Open()), txMgr(txMgr) {
+        storage::MergeValue value;
+        value.set_action(storage::PUT);
+        value.set_txid(txn->GetTxId());
+        valueStr = value.SerializeAsString();
+    }
 
     void AddVertex(const VertexId& vertexId) {
         storage::VertexKey key;
         key.set_type(vertexId.type);
         key.set_id(vertexId.id);
 
-        storage.db->Put(wo, storage.vertices, key.SerializeAsString(), tx, rocksdb::Slice("a"));
+        rocksdb::Status status =
+            storage.db->Put(wo, storage.vertices, key.SerializeAsString(), tx, valueStr);
+        assert(status.ok());
     }
 
     void AddLabel(const VertexId& vertexId, const std::string label) {
@@ -219,12 +569,22 @@ class WriteTransaction : ReadTransaction {
         vertexKey->set_type(vertexId.type);
         vertexKey->set_id(vertexId.id);
 
-        storage.db->Put(wo, storage.index, key.SerializeAsString(), tx, rocksdb::Slice("a"));
+        txn->Touch(vertexId);
+        rocksdb::Status status =
+            storage.db->Put(wo, storage.index, key.SerializeAsString(), tx, valueStr);
+        assert(status.ok());
     }
 
     void AddEdge(const std::string& label, const VertexId& from, const VertexId& to) {
+        txn->Touch(from);
+        txn->Touch(to);
         AddEdgeWithDirection(label, OUT, from, to);
         AddEdgeWithDirection(label, IN, to, from);
+    }
+
+    uint64_t Commit() {
+        txMgr.Commit(*txn.get());
+        return txn->GetTxId();
     }
 
    private:
@@ -245,9 +605,13 @@ class WriteTransaction : ReadTransaction {
         otherKey->set_type(other.type);
         otherKey->set_id(other.id);
 
-        storage.db->Put(wo, storage.edges, key.SerializeAsString(), tx, rocksdb::Slice("a"));
+        rocksdb::Status status =
+            storage.db->Put(wo, storage.edges, key.SerializeAsString(), tx, valueStr);
+        assert(status.ok());
     }
 
+    std::string valueStr;
+    TransactionManager& txMgr;
     rocksdb::WriteOptions wo;
 };
 
@@ -259,6 +623,7 @@ class Graph {
         rocksdb::Options options;
         options.create_if_missing = true;
         options.create_missing_column_families = true;
+        // options.merge_operator.reset(new TxMergeOperator(txMgr));
 
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor());
 
@@ -286,52 +651,64 @@ class Graph {
         storage.db->DestroyColumnFamilyHandle(storage._default);
     }
 
-    ReadTransaction* OpenForRead(long txId) { return new ReadTransaction(storage, txId); }
+    ReadTransaction* OpenForRead(uint64_t txId = -1) {
+        return new ReadTransaction(storage, txMgr.OpenForRead(txId));
+    }
 
-    WriteTransaction* OpenForWrite(long txId) { return new WriteTransaction(storage, txId); }
+    WriteTransaction* OpenForWrite() { return new WriteTransaction(storage, txMgr); }
 
    private:
+    TransactionManager txMgr;
     Storage storage;
 };
 
 int main() {
+    std::filesystem::remove_all("/tmp/graphdb");
     Graph graph("/tmp/graphdb");
-    std::unique_ptr<WriteTransaction> write(graph.OpenForWrite(1));
-    VertexId vertexId = {"component", 1};
+    std::unique_ptr<WriteTransaction> write(graph.OpenForWrite());
+    VertexId vertexId = {"c", 1};
     write->AddVertex(vertexId);
     write->AddLabel(vertexId, "ye-label");
-
-    std::unique_ptr<ReadTransaction> read(graph.OpenForRead(2));
+    uint64_t writeTx = write->Commit();
 
     std::cout << "Fetching vertices by label" << std::endl;
-    std::unique_ptr<IndexVertexIterator> vertices(
-        read->GetVerticesByLabel("ye-label", "component"));
-    while (vertices->Valid()) {
-        const VertexId& id = vertices->Get();
-        std::cout << id.type << ":" << id.id << std::endl;
-        vertices->Next();
+    {
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::unique_ptr<IndexVertexIterator> vertices(
+            read->GetVerticesByLabel("ye-label", "c"));
+        while (vertices->Valid()) {
+            const VertexId& id = vertices->Get();
+            std::cout << id.type << ":" << id.id << std::endl;
+            vertices->Next();
+        }
     }
 
-    VertexId otherId = {"component", 2};
-    write->AddVertex(otherId);
-    write->AddEdge("peer", vertexId, otherId);
+    std::unique_ptr<WriteTransaction> writeMore(graph.OpenForWrite());
+    VertexId otherId = {"c", 2};
+    writeMore->AddVertex(otherId);
+    writeMore->AddEdge("peer", vertexId, otherId);
 
     std::cout << "Fetching edges from vertex" << std::endl;
-    std::unique_ptr<EdgeIterator> edges(
-        read->GetEdges(vertexId, "peer", OUT));
-    while (edges->Valid()) {
-        const Edge& edge = edges->Get();
-        std::cout << edge.otherId.type << ":" << edge.otherId.id << std::endl;
-        edges->Next();
+    {
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::unique_ptr<EdgeIterator> edges(read->GetEdges(vertexId, "peer", OUT));
+        while (edges->Valid()) {
+            const Edge& edge = edges->Get();
+            std::cout << edge.otherId.type << ":" << edge.otherId.id << std::endl;
+            edges->Next();
+        }
     }
+    writeMore->Commit();
 
     std::cout << "Fetching vertices by type" << std::endl;
-    std::unique_ptr<VertexIterator> bytype(
-        read->GetVerticesByType("component"));
-    while (bytype->Valid()) {
-        const VertexId& id = bytype->Get();
-        std::cout << id.type << ":" << id.id << std::endl;
-        bytype->Next();
+    {
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(writeTx));
+        std::unique_ptr<VertexIterator> bytype(read->GetVerticesByType("c"));
+        while (bytype->Valid()) {
+            const VertexId& id = bytype->Get();
+            std::cout << id.type << ":" << id.id << std::endl;
+            bytype->Next();
+        }
     }
 
     /*

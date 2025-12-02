@@ -28,8 +28,19 @@ message EdgeKey {
     VertexKey other = 4;
 }
 
+enum MergeAction {
+    PUT = 0;
+    DELETE = 1;
+}
+
+message MergeValue {
+    int64 txId = 1;             // for merge operator - it only gets to see values
+    MergeAction action = 2;
+}
+
 /**
  * Querying prefixes
+ * These are just used to determine prefix length, by relying on the protobuf serialization.
  */
 message VertexByType {
     string type = 1;

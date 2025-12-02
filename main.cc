@@ -177,9 +177,13 @@ class TxMergeOperator : public rocksdb::MergeOperator {
     bool FullMergeV2(
         const MergeOperationInput& merge_in, MergeOperationOutput* merge_out) const override {
         storage::MergeValue value;
-        value.set_action(storage::DELETE);
-        value.set_txid(0);
-        merge_out->new_value = value.SerializeAsString();
+        if (merge_in.existing_value) {
+            merge_out->new_value = merge_in.existing_value->ToString(false);
+        } else {
+            value.set_action(storage::DELETE);
+            value.set_txid(0);
+            merge_out->new_value = value.SerializeAsString();
+        }
 
         // std::cout << "MERGING KEY " << merge_in.key.ToString(true) << std::endl;
         for (auto it = merge_in.operand_list.rbegin(); it != merge_in.operand_list.rend();
@@ -200,28 +204,12 @@ class TxMergeOperator : public rocksdb::MergeOperator {
     TransactionManager& txMgr;
 };
 
-/*
 class TxCompactionFilter : public rocksdb::CompactionFilter {
    public:
     TxCompactionFilter(TransactionManager& txMgr) : txMgr(txMgr) {}
 
     const char* Name() const { return "TxCompactionFilter"; }
 
-    // The table file creation process invokes this method before adding a kv to
-    // the table file. A return value of false indicates that the kv should be
-    // preserved in the new table file and a return value of true indicates
-    // that this key-value should be removed (that is, converted to a tombstone).
-    // The application can inspect the existing value of the key and make decision
-    // based on it.
-    //
-    // Key-Values that are results of merge operation during table file creation
-    // are not passed into this function. Currently, when you have a mix of Put()s
-    // and Merge()s on a same key, we only guarantee to process the merge operands
-    // through the `CompactionFilter`s. Put()s might be processed, or might not.
-    //
-    // When the value is to be preserved, the application has the option
-    // to modify the existing_value and pass it back through new_value.
-    // value_changed needs to be set to true in this case.
     bool Filter(
         int level,
         const rocksdb::Slice& key,
@@ -236,9 +224,6 @@ class TxCompactionFilter : public rocksdb::CompactionFilter {
         return value.action() == storage::DELETE;
     }
 
-    // The table file creation process invokes this method on every merge operand.
-    // If this method returns true, the merge operand will be ignored and not
-    // written out in the new table file.
     bool FilterMergeOperand(
         int level, const rocksdb::Slice&  key , const rocksdb::Slice& operand) const {
         storage::MergeValue value;
@@ -249,7 +234,6 @@ class TxCompactionFilter : public rocksdb::CompactionFilter {
    private:
     TransactionManager& txMgr;
 };
-*/
 
 enum Direction { IN, OUT };
 
@@ -786,6 +770,8 @@ class Graph {
         options.create_if_missing = true;
         options.create_missing_column_families = true;
         options.merge_operator.reset(new TxMergeOperator(txMgr));
+        compactionFilter.reset(new TxCompactionFilter(txMgr));
+        options.compaction_filter = compactionFilter.get();
 
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor());
 
@@ -824,6 +810,7 @@ class Graph {
    private:
     TransactionManager txMgr;
     Storage storage;
+    std::unique_ptr<rocksdb::CompactionFilter> compactionFilter;
 };
 
 int main() {
@@ -934,72 +921,31 @@ int main() {
             std::stringstream ss;
             ss << edge.otherId.type << ":" << edge.otherId.id;
             found.insert(ss.str());
-            std::cout << "FOUND " << ss.str() << std::endl;
             edges->Next();
         }
 
         assert(found == expected);
     }
 
-    /*
-    rocksdb::DB* db;
-    std::string ts_0;
-    std::string ts_2;
-    std::string ts_4;
-    rocksdb::WriteOptions wo;
-    db->Put(
-        wo,
-        db->DefaultColumnFamily(),
-        rocksdb::Slice("key"),
-        rocksdb::EncodeU64Ts(0, &ts_0),
-        rocksdb::Slice("a"));
-    db->Put(
-        wo,
-        db->DefaultColumnFamily(),
-        rocksdb::Slice("key"),
-        rocksdb::EncodeU64Ts(2, &ts_2),
-        rocksdb::Slice("b"));
-    db->Delete(
-        wo, db->DefaultColumnFamily(), rocksdb::Slice("key"), rocksdb::EncodeU64Ts(4, &ts_4));
-    */
+    std::unique_ptr<WriteTransaction> addEdgeRollback(graph.OpenForWrite());
+    addEdgeRollback->AddEdge("peer", vertexId, otherId);
+    addEdgeRollback->Rollback();
 
-    /**
-     * Query over Time
-     * - iterator with iter_start_ts only returns updates within the time-range
-     *   results are from most recent to oldest
-     * - other iterator returns the view at the start of the interval
-     */
-    /*
-    std::string ts_1;
-    std::string ts_5;
-    rocksdb::Slice from(rocksdb::EncodeU64Ts(1, &ts_1));
-    rocksdb::Slice to(rocksdb::EncodeU64Ts(5, &ts_5));
+    std::cout << "Fetching edges from vertex - after edge addition & rollback" << std::endl;
     {
-        rocksdb::ReadOptions readOptions;
-        readOptions.timestamp = &to;
-        readOptions.iter_start_ts = &from;
-        rocksdb::Iterator* iter = db->NewIterator(readOptions);
-        iter->SeekToFirst();
-        while (iter->Valid()) {
-            // std::cout << "key: " << iter->key().data() << " => " << iter->value().data() <<
-            // std::endl;
-            std::cout << "key: " << iter->key().ToString() << " => " << iter->value().ToString()
-                      << std::endl;
-            iter->Next();
+        std::set<std::string> expected;
+
+        std::set<std::string> found;
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::unique_ptr<EdgeIterator> edges(read->GetEdges(vertexId, "peer", OUT));
+        while (edges->Valid()) {
+            const Edge& edge = edges->Get();
+            std::stringstream ss;
+            ss << edge.otherId.type << ":" << edge.otherId.id;
+            found.insert(ss.str());
+            edges->Next();
         }
+
+        assert(found == expected);
     }
-    {
-        rocksdb::ReadOptions readOptions;
-        readOptions.timestamp = &from;
-        rocksdb::Iterator* iter = db->NewIterator(readOptions);
-        iter->SeekToFirst();
-        while (iter->Valid()) {
-            // std::cout << "key: " << iter->key().data() << " => " << iter->value().data() <<
-            // std::endl;
-            std::cout << "key: " << iter->key().ToString() << " => " << iter->value().ToString()
-                      << std::endl;
-            iter->Next();
-        }
-    }
-    */
 }

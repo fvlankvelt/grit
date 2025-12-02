@@ -168,7 +168,6 @@ class TransactionManager {
  * Should only be used on time ranges that exclude the "active window" as in-progress
  * transactions are still undecided.
  */
-/*
 class TxMergeOperator : public rocksdb::MergeOperator {
    public:
     TxMergeOperator(TransactionManager& txMgr) : txMgr(txMgr) {}
@@ -177,13 +176,20 @@ class TxMergeOperator : public rocksdb::MergeOperator {
 
     bool FullMergeV2(
         const MergeOperationInput& merge_in, MergeOperationOutput* merge_out) const override {
-        merge_out->new_value = merge_in.existing_value->ToStringView();
-        for (auto it = merge_in.operand_list.begin(); it != merge_in.operand_list.end(); it++) {
-            storage::MergeValue value;
+        storage::MergeValue value;
+        value.set_action(storage::DELETE);
+        value.set_txid(0);
+        merge_out->new_value = value.SerializeAsString();
+
+        // std::cout << "MERGING KEY " << merge_in.key.ToString(true) << std::endl;
+        for (auto it = merge_in.operand_list.rbegin(); it != merge_in.operand_list.rend();
+             it++) {
             value.ParseFromString(it->ToStringView());
+            // std::cout << "  CHECKING " << value.txid() << " - " << value.action() <<
+            // std::endl;
 
             if (!txMgr.IsInvalid(value.txid())) {
-                merge_out->new_value = it->data();
+                merge_out->new_value = it->ToString();
                 break;
             }
         }
@@ -193,7 +199,6 @@ class TxMergeOperator : public rocksdb::MergeOperator {
    private:
     TransactionManager& txMgr;
 };
-*/
 
 /*
 class TxCompactionFilter : public rocksdb::CompactionFilter {
@@ -261,7 +266,7 @@ struct Storage {
     rocksdb::ColumnFamilyHandle* index;
     rocksdb::ColumnFamilyHandle* vertices;
     rocksdb::ColumnFamilyHandle* edges;
-    // rocksdb::ColumnFamilyHandle* labels;
+    rocksdb::ColumnFamilyHandle* labels;
 };
 
 template <class T>
@@ -303,26 +308,28 @@ class EntryIterator {
             uint64_t keyTxId;
             storage::MergeValue value;
             if (cmp > 0) {
-                DecodeU64Ts(frozen->timestamp(), &keyTxId);
+                value.ParseFromString(frozen->value().ToStringView());
+                keyTxId = value.txid();
+                DecodeU64Ts(fluid->timestamp(), &keyTxId);
                 if (txn->IsExcluded(keyTxId)) {
                     frozen->Next();
                     continue;
                 }
                 currentKey = frozen->key().ToString();
                 assert(frozen->key().ToString().compare(currentKey) == 0);
-                value.ParseFromString(frozen->value().ToStringView());
             } else {
-                DecodeU64Ts(fluid->timestamp(), &keyTxId);
+                value.ParseFromString(fluid->value().ToStringView());
+                keyTxId = value.txid();
                 if (txn->IsExcluded(keyTxId)) {
                     fluid->Next();
                     continue;
                 }
                 // time-range iterator includes user-defined timestamp in key
+                // strip it to filter out subsequent entries with the same key
                 currentKey = FluidKey();
-                value.ParseFromString(fluid->value().ToStringView());
             }
 
-            // skip deleted keys
+            // don't report deleted keys
             if (value.action() == storage::PUT) {
                 populate(currentKey);
                 foundKey = true;
@@ -353,7 +360,7 @@ class EntryIterator {
     bool IsValidKey(const rocksdb::Slice& key) const { return key.starts_with(prefix); }
 
     std::string FluidKey() const {
-        return std::string(fluid->key().data(), fluid->key().size() - 16);
+        return std::string(fluid->key().data(), fluid->key().size() - 8);
     }
 
     std::string currentKey;
@@ -425,6 +432,29 @@ class IndexVertexIterator : public EntryIterator<VertexId> {
     }
 };
 
+class LabelIterator : public EntryIterator<std::string> {
+   public:
+    LabelIterator(
+        rocksdb::Iterator* fluid,
+        rocksdb::Iterator* frozen,
+        const std::string& prefix,
+        const std::shared_ptr<Transaction>& txn)
+        : EntryIterator(fluid, frozen, prefix, txn) {
+        fluid->Seek(prefix);
+        frozen->Seek(prefix);
+        Next();
+    }
+
+   protected:
+    void populate(const rocksdb::Slice& keySlice) {
+        storage::LabelKey key;
+        key.ParseFromString(keySlice.ToStringView());
+        current = key.label();
+    }
+
+    std::string ToString(std::string current) { return current; }
+};
+
 class EdgeIterator : public EntryIterator<Edge> {
    public:
     EdgeIterator(
@@ -442,13 +472,13 @@ class EdgeIterator : public EntryIterator<Edge> {
     void populate(const rocksdb::Slice& keySlice) {
         storage::EdgeKey key;
         key.ParseFromString(keySlice.ToStringView());
-
         current = Edge{
             VertexId{key.vertex().type(), key.vertex().id()},
             VertexId{key.other().type(), key.other().id()},
             key.label(),
             key.direction() == storage::Direction::IN ? IN : OUT};
     }
+
     std::string ToString(Edge edge) {
         std::stringstream ss;
         ss << edge.direction << " " << edge.label << " " << edge.vertexId.id << " - "
@@ -507,6 +537,24 @@ class ReadTransaction {
             txn);
     }
 
+    LabelIterator* GetLabels(const VertexId& vertexId) {
+        storage::LabelKey key;
+        key.mutable_vertex()->set_type(vertexId.type);
+        key.mutable_vertex()->set_id(vertexId.id);
+        std::string firstKey = key.SerializeAsString();
+
+        storage::LabelByVertex ivbt;
+        ivbt.mutable_vertex()->set_type(vertexId.type);
+        ivbt.mutable_vertex()->set_id(vertexId.id);
+        std::string trimmed = ivbt.SerializeAsString();
+
+        return new LabelIterator(
+            storage.db->NewIterator(fluidReadOptions, storage.labels),
+            storage.db->NewIterator(frozenReadOptions, storage.labels),
+            firstKey.substr(0, trimmed.size()),
+            txn);
+    }
+
     EdgeIterator* GetEdges(
         const VertexId& vertexId, const std::string& label, const Direction direction) {
         storage::EdgeKey edge;
@@ -522,6 +570,24 @@ class ReadTransaction {
         ebl.set_label(label);
         ebl.set_direction(direction == IN ? storage::Direction::IN : storage::Direction::OUT);
         std::string trimmed = ebl.SerializeAsString();
+
+        return new EdgeIterator(
+            storage.db->NewIterator(fluidReadOptions, storage.edges),
+            storage.db->NewIterator(frozenReadOptions, storage.edges),
+            firstKey.substr(0, trimmed.size()),
+            txn);
+    }
+
+    EdgeIterator* GetEdges(const VertexId& vertexId) {
+        storage::EdgeKey edge;
+        edge.mutable_vertex()->set_type(vertexId.type);
+        edge.mutable_vertex()->set_id(vertexId.id);
+        std::string firstKey = edge.SerializeAsString();
+
+        storage::EdgeByVertex ebv;
+        ebv.mutable_vertex()->set_type(vertexId.type);
+        ebv.mutable_vertex()->set_id(vertexId.id);
+        std::string trimmed = ebv.SerializeAsString();
 
         return new EdgeIterator(
             storage.db->NewIterator(fluidReadOptions, storage.edges),
@@ -549,7 +615,9 @@ class WriteTransaction : ReadTransaction {
         storage::MergeValue value;
         value.set_action(storage::PUT);
         value.set_txid(txn->GetTxId());
-        valueStr = value.SerializeAsString();
+        putStr = value.SerializeAsString();
+        value.set_action(storage::DELETE);
+        deleteStr = value.SerializeAsString();
     }
 
     void AddVertex(const VertexId& vertexId) {
@@ -558,11 +626,64 @@ class WriteTransaction : ReadTransaction {
         key.set_id(vertexId.id);
 
         rocksdb::Status status =
-            storage.db->Put(wo, storage.vertices, key.SerializeAsString(), tx, valueStr);
+            storage.db->Merge(wo, storage.vertices, key.SerializeAsString(), tx, putStr);
         assert(status.ok());
     }
 
-    void AddLabel(const VertexId& vertexId, const std::string label) {
+    void RemoveVertex(const VertexId& vertexId) {
+        txn->Touch(vertexId);
+
+        storage::VertexKey key;
+        key.set_type(vertexId.type);
+        key.set_id(vertexId.id);
+
+        std::unique_ptr<EdgeIterator> edges(GetEdges(vertexId));
+        while (edges->Valid()) {
+            const Edge& edge = edges->Get();
+            if (edge.direction == OUT) {
+                RemoveEdge(edge.label, edge.vertexId, edge.otherId);
+            } else {
+                RemoveEdge(edge.label, edge.otherId, edge.vertexId);
+            }
+            edges->Next();
+        }
+
+        std::unique_ptr<LabelIterator> labels(GetLabels(vertexId));
+        while (labels->Valid()) {
+            const std::string& label = labels->Get();
+            RemoveLabel(vertexId, label);
+            labels->Next();
+        }
+
+        rocksdb::Status status =
+            storage.db->Merge(wo, storage.vertices, key.SerializeAsString(), tx, deleteStr);
+        assert(status.ok());
+    }
+
+    void AddLabel(const VertexId& vertexId, const std::string& label) {
+        storage::IndexKey indexKey;
+        indexKey.set_label(label);
+        storage::VertexKey* vertexKey = indexKey.mutable_vertex();
+        vertexKey->set_type(vertexId.type);
+        vertexKey->set_id(vertexId.id);
+
+        txn->Touch(vertexId);
+        rocksdb::Status status =
+            storage.db->Merge(wo, storage.index, indexKey.SerializeAsString(), tx, putStr);
+        assert(status.ok());
+
+        storage::LabelKey labelKey;
+        labelKey.set_label(label);
+        vertexKey = labelKey.mutable_vertex();
+        vertexKey->set_type(vertexId.type);
+        vertexKey->set_id(vertexId.id);
+
+        status =
+            storage.db->Merge(wo, storage.labels, labelKey.SerializeAsString(), tx, putStr);
+        assert(status.ok());
+    }
+
+    void RemoveLabel(const VertexId& vertexId, const std::string label) {
         storage::IndexKey key;
         key.set_label(label);
         storage::VertexKey* vertexKey = key.mutable_vertex();
@@ -571,8 +692,17 @@ class WriteTransaction : ReadTransaction {
 
         txn->Touch(vertexId);
         rocksdb::Status status =
-            storage.db->Put(wo, storage.index, key.SerializeAsString(), tx, valueStr);
+            storage.db->Merge(wo, storage.index, key.SerializeAsString(), tx, deleteStr);
         assert(status.ok());
+
+        storage::LabelKey labelKey;
+        labelKey.set_label(label);
+        vertexKey = labelKey.mutable_vertex();
+        vertexKey->set_type(vertexId.type);
+        vertexKey->set_id(vertexId.id);
+
+        status =
+            storage.db->Merge(wo, storage.labels, labelKey.SerializeAsString(), tx, deleteStr);
     }
 
     void AddEdge(const std::string& label, const VertexId& from, const VertexId& to) {
@@ -582,10 +712,19 @@ class WriteTransaction : ReadTransaction {
         AddEdgeWithDirection(label, IN, to, from);
     }
 
+    void RemoveEdge(const std::string& label, const VertexId& from, const VertexId& to) {
+        txn->Touch(from);
+        txn->Touch(to);
+        RemoveEdgeWithDirection(label, OUT, from, to);
+        RemoveEdgeWithDirection(label, IN, to, from);
+    }
+
     uint64_t Commit() {
         txMgr.Commit(*txn.get());
         return txn->GetTxId();
     }
+
+    void Rollback() { txMgr.Rollback(txn->GetTxId()); }
 
    private:
     void AddEdgeWithDirection(
@@ -606,11 +745,34 @@ class WriteTransaction : ReadTransaction {
         otherKey->set_id(other.id);
 
         rocksdb::Status status =
-            storage.db->Put(wo, storage.edges, key.SerializeAsString(), tx, valueStr);
+            storage.db->Merge(wo, storage.edges, key.SerializeAsString(), tx, putStr);
         assert(status.ok());
     }
 
-    std::string valueStr;
+    void RemoveEdgeWithDirection(
+        const std::string& label,
+        const Direction direction,
+        const VertexId& vertex,
+        const VertexId& other) {
+        storage::EdgeKey key;
+        key.set_label(label);
+        key.set_direction(direction == OUT ? storage::Direction::OUT : storage::Direction::IN);
+
+        storage::VertexKey* vertexKey = key.mutable_vertex();
+        vertexKey->set_type(vertex.type);
+        vertexKey->set_id(vertex.id);
+
+        storage::VertexKey* otherKey = key.mutable_other();
+        otherKey->set_type(other.type);
+        otherKey->set_id(other.id);
+
+        rocksdb::Status status =
+            storage.db->Merge(wo, storage.edges, key.SerializeAsString(), tx, deleteStr);
+        assert(status.ok());
+    }
+
+    std::string putStr;
+    std::string deleteStr;
     TransactionManager& txMgr;
     rocksdb::WriteOptions wo;
 };
@@ -623,7 +785,7 @@ class Graph {
         rocksdb::Options options;
         options.create_if_missing = true;
         options.create_missing_column_families = true;
-        // options.merge_operator.reset(new TxMergeOperator(txMgr));
+        options.merge_operator.reset(new TxMergeOperator(txMgr));
 
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor());
 
@@ -632,6 +794,7 @@ class Graph {
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("index", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("vertices", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("edges", cfOptions));
+        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("labels", cfOptions));
 
         std::vector<rocksdb::ColumnFamilyHandle*> handles;
         rocksdb::Status status =
@@ -642,6 +805,7 @@ class Graph {
         storage.index = handles[1];
         storage.vertices = handles[2];
         storage.edges = handles[3];
+        storage.labels = handles[4];
     }
 
     ~Graph() {
@@ -665,50 +829,116 @@ class Graph {
 int main() {
     std::filesystem::remove_all("/tmp/graphdb");
     Graph graph("/tmp/graphdb");
-    std::unique_ptr<WriteTransaction> write(graph.OpenForWrite());
+    std::unique_ptr<WriteTransaction> createVertex(graph.OpenForWrite());
     VertexId vertexId = {"c", 1};
-    write->AddVertex(vertexId);
-    write->AddLabel(vertexId, "ye-label");
-    uint64_t writeTx = write->Commit();
+    createVertex->AddVertex(vertexId);
+    createVertex->AddLabel(vertexId, "ye-label");
+    uint64_t createVertexTx = createVertex->Commit();
 
     std::cout << "Fetching vertices by label" << std::endl;
     {
+        std::set<std::string> expected;
+        expected.insert("c:1");
+
+        std::set<std::string> found;
         std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
         std::unique_ptr<IndexVertexIterator> vertices(
             read->GetVerticesByLabel("ye-label", "c"));
         while (vertices->Valid()) {
             const VertexId& id = vertices->Get();
-            std::cout << id.type << ":" << id.id << std::endl;
+            std::stringstream ss;
+            ss << id.type << ":" << id.id;
+            found.insert(ss.str());
             vertices->Next();
         }
+
+        assert(found == expected);
     }
 
-    std::unique_ptr<WriteTransaction> writeMore(graph.OpenForWrite());
+    std::unique_ptr<WriteTransaction> addEdge(graph.OpenForWrite());
     VertexId otherId = {"c", 2};
-    writeMore->AddVertex(otherId);
-    writeMore->AddEdge("peer", vertexId, otherId);
+    addEdge->AddVertex(otherId);
+    addEdge->AddEdge("peer", vertexId, otherId);
+    uint64_t addEdgeTx = addEdge->Commit();
 
     std::cout << "Fetching edges from vertex" << std::endl;
     {
+        std::set<std::string> expected;
+        expected.insert("c:2");
+
+        std::set<std::string> found;
         std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
         std::unique_ptr<EdgeIterator> edges(read->GetEdges(vertexId, "peer", OUT));
         while (edges->Valid()) {
             const Edge& edge = edges->Get();
-            std::cout << edge.otherId.type << ":" << edge.otherId.id << std::endl;
+            std::stringstream ss;
+            ss << edge.otherId.type << ":" << edge.otherId.id;
+            found.insert(ss.str());
             edges->Next();
         }
-    }
-    writeMore->Commit();
 
-    std::cout << "Fetching vertices by type" << std::endl;
+        assert(found == expected);
+    }
+
+    std::cout << "Fetching vertices by type - timetravel to initial" << std::endl;
     {
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(writeTx));
+        std::set<std::string> expected;
+        expected.insert("c:1");
+
+        std::set<std::string> found;
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(createVertexTx));
         std::unique_ptr<VertexIterator> bytype(read->GetVerticesByType("c"));
         while (bytype->Valid()) {
             const VertexId& id = bytype->Get();
-            std::cout << id.type << ":" << id.id << std::endl;
+            std::stringstream ss;
+            ss << id.type << ":" << id.id;
+            found.insert(ss.str());
             bytype->Next();
         }
+
+        assert(found == expected);
+    }
+
+    std::unique_ptr<WriteTransaction> removeEdge(graph.OpenForWrite());
+    removeEdge->RemoveEdge("peer", vertexId, otherId);
+    removeEdge->Commit();
+
+    std::cout << "Fetching edges from vertex - timetravel to before edge removal" << std::endl;
+    {
+        std::set<std::string> expected;
+        expected.insert("c:2");
+
+        std::set<std::string> found;
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(addEdgeTx));
+        std::unique_ptr<EdgeIterator> edges(read->GetEdges(vertexId, "peer", OUT));
+        while (edges->Valid()) {
+            const Edge& edge = edges->Get();
+            std::stringstream ss;
+            ss << edge.otherId.type << ":" << edge.otherId.id;
+            found.insert(ss.str());
+            edges->Next();
+        }
+
+        assert(found == expected);
+    }
+
+    std::cout << "Fetching edges from vertex - after edge removal" << std::endl;
+    {
+        std::set<std::string> expected;
+
+        std::set<std::string> found;
+        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::unique_ptr<EdgeIterator> edges(read->GetEdges(vertexId, "peer", OUT));
+        while (edges->Valid()) {
+            const Edge& edge = edges->Get();
+            std::stringstream ss;
+            ss << edge.otherId.type << ":" << edge.otherId.id;
+            found.insert(ss.str());
+            std::cout << "FOUND " << ss.str() << std::endl;
+            edges->Next();
+        }
+
+        assert(found == expected);
     }
 
     /*

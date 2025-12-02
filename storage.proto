@@ -16,6 +16,11 @@ message IndexKey {
     VertexKey vertex = 2;
 }
 
+message LabelKey {
+    VertexKey vertex = 1;
+    string label = 2;
+}
+
 enum Direction {
     IN = 0;
     OUT = 1;
@@ -51,8 +56,16 @@ message IndexVertexByType {
     VertexByType vertexByType = 2;
 }
 
+message LabelByVertex {
+    VertexKey vertex = 1;
+}
+
 message EdgeByLabel {
     VertexKey vertex = 1;
     string label = 2;
     Direction direction = 3;
+}
+
+message EdgeByVertex {
+    VertexKey vertex = 1;
 }

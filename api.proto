@@ -1,0 +1,85 @@
+edition = "2023";
+
+package api;
+
+import "google/protobuf/empty.proto";
+
+service Grit {
+
+  // txn management
+  rpc OpenTransaction(OpenRequest) returns (Transaction);
+  rpc Commit(Transaction) returns (google.protobuf.Empty);
+  rpc Rollback(Transaction) returns (google.protobuf.Empty);
+
+  // write operations
+  rpc AddVertex(AddVertexRequest) returns (google.protobuf.Empty);
+  rpc RemoveVertex(RemoveVertexRequest) returns (google.protobuf.Empty);
+  rpc AddLabel(AddLabelRequest) returns (google.protobuf.Empty);
+  rpc RemoveLabel(RemoveLabelRequest) returns (google.protobuf.Empty);
+  rpc AddEdge(AddEdgeRequest) returns (google.protobuf.Empty);
+  rpc RemoveEdge(RemoveEdgeRequest) returns (google.protobuf.Empty);
+
+  // read operations
+  rpc GetVerticesByType(GetVerticesByTypeRequest) returns (stream VertexId);
+}
+
+enum TransactionType {
+  READ = 0;
+  WRITE = 1;
+}
+
+message OpenRequest {
+  TransactionType type = 1;
+  uint64 txId = 2;
+}
+
+message Transaction {
+  TransactionType type = 1;
+  uint64 txId = 2;
+}
+
+message VertexId {
+  string type = 1;
+  int64 id = 2;
+}
+
+message AddVertexRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+}
+
+message RemoveVertexRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+}
+
+message AddLabelRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+  string label = 3;
+}
+
+message RemoveLabelRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+  string label = 3;
+}
+
+message AddEdgeRequest {
+  uint64 txId = 1;
+  string label = 2;
+  VertexId fromVertexId = 3;
+  VertexId toVertexId = 4;
+}
+
+message RemoveEdgeRequest {
+  uint64 txId = 1;
+  string label = 2;
+  VertexId fromVertexId = 3;
+  VertexId toVertexId = 4;
+}
+
+message GetVerticesByTypeRequest {
+  uint64 txId = 1;
+  string type = 2;
+}

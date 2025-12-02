@@ -39,7 +39,7 @@ enum MergeAction {
 }
 
 message MergeValue {
-    int64 txId = 1;             // for merge operator - it only gets to see values
+    uint64 txId = 1;             // for merge operator - it only gets to see values
     MergeAction action = 2;
 }
 

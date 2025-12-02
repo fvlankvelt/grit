@@ -3,10 +3,13 @@ cmake_minimum_required(VERSION 3.28)
 project(Grit)
 
 find_package(RocksDB REQUIRED)
+find_package(gRPC REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(absl REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
 
 # Set source and output directories
 set(STORAGE_DEF ${CMAKE_SOURCE_DIR}/storage.proto)
@@ -27,8 +30,11 @@ add_custom_command(
 # Command to generate C++ files from the proto file
 add_custom_command(
     OUTPUT ${CMAKE_SOURCE_DIR}/api.pb.cc ${CMAKE_SOURCE_DIR}/api.pb.h
+           ${CMAKE_SOURCE_DIR}/api.grpc.pb.cc ${CMAKE_SOURCE_DIR}/api.grpc.pb.h
     COMMAND ${PROTOC_EXECUTABLE}
             --cpp_out=${CMAKE_SOURCE_DIR}
+            --grpc_out=${CMAKE_SOURCE_DIR}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXECUTABLE}
             --proto_path=${CMAKE_SOURCE_DIR}
             ${API_DEF}
     DEPENDS ${API_DEF}
@@ -37,9 +43,11 @@ add_custom_command(
 )
 
 # Custom target for generating proto files
-add_custom_target(generate_storage
+add_custom_target(generate_serialization
     DEPENDS ${CMAKE_SOURCE_DIR}/storage.pb.cc ${CMAKE_SOURCE_DIR}/storage.pb.h
-    COMMENT "Running generate_storage target"
+            ${CMAKE_SOURCE_DIR}/api.pb.cc ${CMAKE_SOURCE_DIR}/api.pb.h
+            ${CMAKE_SOURCE_DIR}/api.grpc.pb.cc ${CMAKE_SOURCE_DIR}/api.grpc.pb.h
+    COMMENT "Generating serialization code"
 )
 
 # Add NuRaft subdirectory
@@ -50,6 +58,8 @@ add_executable(Grit)
 target_sources(Grit PRIVATE
   main.cc
   ${CMAKE_SOURCE_DIR}/storage.pb.cc
+  ${CMAKE_SOURCE_DIR}/api.pb.cc
+  ${CMAKE_SOURCE_DIR}/api.grpc.pb.cc
   nuraft/examples/in_memory_log_store.cxx
   nuraft/examples/logger.cc
 )
@@ -63,8 +73,11 @@ target_link_libraries(Grit PRIVATE
   absl::log
   absl::check
   NuRaft::static_lib
+  gRPC::grpc
+  gRPC::grpc++
+  gRPC::grpc++_reflection
 )
 set_property(TARGET Grit PROPERTY CXX_STANDARD 20)
 
-add_dependencies(Grit generate_storage)
+add_dependencies(Grit generate_serialization)
 

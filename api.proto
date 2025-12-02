@@ -4,7 +4,7 @@ package api;
 
 import "google/protobuf/empty.proto";
 
-service Grit {
+service GritApi {
 
   // txn management
   rpc OpenTransaction(OpenRequest) returns (Transaction);

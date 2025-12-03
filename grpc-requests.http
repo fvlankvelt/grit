@@ -1,0 +1,64 @@
+### open transaction
+GRPC localhost:8000/api.GritApi/OpenTransaction
+
+{
+  "type": "WRITE"
+}
+
+### add vertex
+
+GRPC localhost:8000/api.GritApi/AddVertex
+
+{
+  "txId": "4",
+  "vertexId": {
+    "type": "comp",
+    "id": 2134
+  }
+}
+
+### add vertex
+
+GRPC localhost:8000/api.GritApi/AddVertex
+
+{
+  "txId": "4",
+  "vertexId": {
+    "type": "comp",
+    "id": 1234
+  }
+}
+
+### add edge
+
+GRPC localhost:8000/api.GritApi/AddEdge
+
+{
+  "txId": "4",
+  "label": "ye-vertex",
+  "fromVertexId": {
+    "type": "comp",
+    "id": 2134
+  },
+  "toVertexId": {
+    "type": "comp",
+    "id": 1234
+  }
+}
+
+### commit it
+
+GRPC localhost:8000/api.GritApi/Commit
+
+{
+  "txId": "4"
+}
+
+### read
+
+GRPC localhost:8000/api.GritApi/GetVerticesByType
+
+{
+  "txId": "5",
+  "type": "comp"
+}

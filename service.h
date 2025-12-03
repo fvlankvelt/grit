@@ -13,16 +13,15 @@
 using namespace nuraft;
 
 template<typename T>
-void ReadBuffer(T &target, const buffer &buffer) {
-    target.ParseFromString(std::string_view(reinterpret_cast<char *>(buffer.data()), buffer.size()));
+void ReadBuffer(T &target, buffer &buffer) {
+    target.ParseFromArray(buffer.data(), buffer.size());
 }
 
 template<typename T>
 ptr<buffer> WriteBuffer(T &target) {
-    std::string serialized = target.SerializeAsString();
-    ptr<buffer> ret = buffer::alloc(serialized.size());
-    buffer_serializer bs(ret);
-    bs.put_raw(serialized.data(), serialized.size());
+    size_t size = target.ByteSizeLong();
+    ptr<buffer> ret = buffer::alloc(size);
+    target.SerializeToArray(ret->data(), size);
     return ret;
 }
 
@@ -204,7 +203,7 @@ public:
         const api::OpenRequest *request,
         api::Transaction *response) {
         api::RaftLogEntry entry;
-        entry.mutable_open()->CopyFrom(*request);;
+        entry.mutable_open()->CopyFrom(*request);
         ptr<buffer> log_entry = WriteBuffer(entry);
 
         auto cmd_result = server_->append_entries({log_entry});

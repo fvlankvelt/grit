@@ -1,21 +1,21 @@
 #pragma once
 
 #include <algorithm>
-#include <cassert>
 #include <cinttypes>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <set>
-#include <sstream>
 #include <utility>
+#include <shared_mutex>
 
 #include "model.h"
+#include "storage.pb.h"
 
 enum TransactionException { TX_IS_READONLY, TX_CONFLICT, TX_INVALIDATED, TX_NOT_IN_PROGRESS };
 
 class Transaction {
-   public:
+public:
     Transaction(
         uint64_t txId, std::set<uint64_t> inProgress, std::set<uint64_t> invalid, bool readOnly)
         : txId(txId), inProgress(inProgress), invalidTxIds(invalid), readOnly(readOnly) {
@@ -27,7 +27,7 @@ class Transaction {
         }
     }
 
-    void Touch(const VertexId& key) {
+    void Touch(const VertexId &key) {
         if (readOnly) {
             throw TX_IS_READONLY;
         }
@@ -45,7 +45,7 @@ class Transaction {
 
     friend class TransactionManager;
 
-   private:
+private:
     // last transaction that can be read
     uint64_t txId;
     // start of in-progress transaction window, there are no in-progress txns before it.
@@ -58,19 +58,73 @@ class Transaction {
 };
 
 class TransactionManager {
-   public:
+public:
+    TransactionManager(): db_(nullptr) {}
+
+    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) const {
+        std::shared_lock lock(mutex);
+        uint64_t tx = txId == -1 ? lastWriteTxId + 1 : txId;
+        return std::make_shared<Transaction>(tx, inProgress, invalid, true);
+    }
+
+    bool IsInvalid(uint64_t txId) const {
+        std::shared_lock lock(mutex);
+        return invalid.find(txId) != invalid.end();
+    }
+
+    void Initialize(rocksdb::DB* db) {
+        db_ = db;
+        rocksdb::ReadOptions options;
+        std::string strState;
+        auto status = db->Get(options, "tx_manager_state", &strState);
+        if (status.IsNotFound()) {
+            return;
+        }
+        assert(status.ok());
+
+        storage::TransactionManagerState state;
+        state.ParseFromString(strState);
+        lastWriteTxId = state.lasttxid();
+        auto inprogress = state.inprogress();
+        for (auto it = inprogress.begin(); it != inprogress.end(); it++) {
+            inProgress.insert(*it);
+        }
+        auto inv = state.invalid();
+        for (auto it = inv.begin(); it != inv.end(); it++) {
+            invalid.insert(*it);
+        }
+
+        auto com = state.committed();
+        for (auto it = com.begin(); it != com.end(); it++) {
+            std::stringstream ss;
+            ss << "tx:" << *it;
+            std::string value;
+            auto status = db->Get(options, ss.str(), &value);
+            assert(status.ok());
+
+            storage::Transaction tx;
+            tx.ParseFromString(value);
+            std::set<VertexId> touched;
+            auto vertex_keys = tx.touched();
+            for (auto key = vertex_keys.begin(); key != vertex_keys.end(); key++) {
+                touched.insert({key->type(), key->id()});
+            }
+            recent.insert(std::pair(tx.txid(), touched));
+        }
+    }
+
     std::shared_ptr<Transaction> Open() {
-        uint64_t txId = ++lastTxId;
+        std::unique_lock lock(mutex);
+        lastWriteTxId += 2;
+        uint64_t txId = lastWriteTxId;
         inProgress.insert(txId);
-        return std::shared_ptr<Transaction>(new Transaction(txId, inProgress, invalid, false));
+        WriteState();
+        return std::make_shared<Transaction>(txId, inProgress, invalid, false);
     }
 
-    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) {
-        uint64_t tx = txId == -1 ? ++lastTxId : txId;
-        return std::shared_ptr<Transaction>(new Transaction(tx, inProgress, invalid, true));
-    }
+    void Commit(const Transaction &txn) {
+        std::unique_lock lock(mutex);
 
-    void Commit(const Transaction& txn) {
         uint64_t txId = txn.GetTxId();
         if (inProgress.find(txId) == inProgress.end()) {
             throw TX_NOT_IN_PROGRESS;
@@ -107,17 +161,25 @@ class TransactionManager {
         } catch (TransactionException te) {
             inProgress.erase(txId);
             invalid.insert(txId);
-            throw te;
+            WriteState();
+            throw;
         }
 
         // hurray!  No conflicts detected
         recent.insert(std::pair(txId, txn.touched));
         inProgress.erase(txId);
+
+        WriteTransaction(txn);
+        WriteState();
     }
 
     void Rollback(uint64_t txId) {
+        std::unique_lock lock(mutex);
+
         inProgress.erase(txId);
         invalid.insert(txId);
+
+        WriteState();
     }
 
     /**
@@ -125,28 +187,71 @@ class TransactionManager {
      * This will abort any transactions that started before expireTx.
      */
     void Advance(uint64_t expireTx) {
+        std::unique_lock lock(mutex);
+
+        rocksdb::WriteOptions writeOptions;
         for (auto it = recent.begin(); it != recent.end();) {
             uint64_t txId = it->first;
             if (txId < expireTx) {
+                std::stringstream ss;
+                ss << "tx:" << txId;
+                auto status = db_->Delete(writeOptions, ss.str());
+                assert(status.ok());
                 it = recent.erase(it);
             } else {
                 ++it;
             }
         }
+
+        WriteState();
     }
 
-    bool IsInvalid(uint64_t txId) const { return invalid.find(txId) != invalid.end(); }
+private:
+    void WriteTransaction(const Transaction &txn) {
+        storage::Transaction state;
+        state.set_txid(txn.GetTxId());
+        for (auto it = txn.touched.begin(); it != txn.touched.end(); it++) {
+            const VertexId& vid = *it;
+            storage::VertexKey* vertexKey = state.add_touched();
+            vertexKey->set_type(vid.type);
+            vertexKey->set_id(vid.id);
+        }
 
-   private:
-    bool Conflict(const std::set<VertexId>& a, const std::set<VertexId>& b) {
+        std::stringstream ss;
+        ss << "tx:" << txn.GetTxId();
+        auto status = db_->Put(rocksdb::WriteOptions(), ss.str(), state.SerializeAsString());
+        assert(status.ok());
+    }
+
+    void WriteState() const {
+        storage::TransactionManagerState state;
+        state.set_lasttxid(lastWriteTxId);
+        for (auto it = inProgress.begin(); it != inProgress.end(); it++) {
+            state.add_inprogress(*it);
+        }
+        for (auto it = invalid.begin(); it != invalid.end(); it++) {
+            state.add_invalid(*it);
+        }
+        for (auto it = recent.begin(); it != recent.end(); it++) {
+            state.add_committed(it->first);
+        }
+        auto status = db_->Put(rocksdb::WriteOptions(), "tx_manager_state", state.SerializeAsString());
+        assert(status.ok());
+    }
+
+    bool Conflict(const std::set<VertexId> &a, const std::set<VertexId> &b) {
         std::set<VertexId> out;
         std::set_intersection(
             a.begin(), a.end(), b.begin(), b.end(), std::inserter(out, out.begin()));
         return out.begin() != out.end();
     }
 
-    uint64_t lastTxId = 0;
-    std::map<uint64_t, std::set<VertexId>> recent;
+    mutable std::shared_mutex mutex;
+
+    rocksdb::DB * db_;
+
+    uint64_t lastWriteTxId = 0;
+    std::map<uint64_t, std::set<VertexId> > recent;
     std::set<uint64_t> inProgress;
 
     // all rolled back and invalidated transactions - this set can be pruned

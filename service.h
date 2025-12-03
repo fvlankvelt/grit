@@ -31,14 +31,6 @@ public:
     StateMachine(ptr<Graph> graph) : graph(graph) {
     }
 
-    bool apply_snapshot(snapshot &s) {
-        return true;
-    }
-
-    ptr<snapshot> last_snapshot() {
-        return nullptr;
-    }
-
     ptr<buffer> commit(const ulong log_idx, buffer &data) {
         last_committed_idx_ = log_idx;
 
@@ -153,8 +145,16 @@ public:
             {request.tovertexid().type(), request.tovertexid().id()});
     }
 
+    bool apply_snapshot(snapshot &s) {
+        return true;
+    }
+
+    ptr<snapshot> last_snapshot() {
+        return nullptr;
+    }
+
     ulong last_commit_index() {
-        return 0;
+        return last_committed_idx_;
     }
 
     void create_snapshot(snapshot &s,
@@ -340,14 +340,14 @@ private:
 
 std::unique_ptr<grpc::Server> server;
 
-void signalHandler(int signum) {
+inline void signalHandler(int signum) {
     if (server) {
         server->Shutdown();
         std::cout << "Server shutting down." << std::endl;
     }
 }
 
-void RunServer(int grpcPort, int raftPort, int raftId) {
+inline void RunServer(int grpcPort, int raftPort, int raftId) {
     std::string server_address("0.0.0.0:" + std::to_string(grpcPort));
     api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>("/tmp/graph"));
 

@@ -12,7 +12,7 @@
 #include "graph.h"
 
 int main() {
-    std::filesystem::remove_all("/tmp/graphdb");
+    // std::filesystem::remove_all("/tmp/graphdb");
     Graph graph("/tmp/graphdb");
     std::unique_ptr<WriteTransaction> createVertex(graph.OpenForWrite());
     VertexId vertexId = {"c", 1};

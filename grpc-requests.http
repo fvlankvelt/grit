@@ -1,5 +1,5 @@
 ### open transaction
-GRPC localhost:8000/api.GritApi/OpenTransaction
+GRPC localhost:8081/api.GritApi/OpenTransaction
 
 {
   "type": "WRITE"
@@ -7,7 +7,7 @@ GRPC localhost:8000/api.GritApi/OpenTransaction
 
 ### add vertex
 
-GRPC localhost:8000/api.GritApi/AddVertex
+GRPC localhost:8081/api.GritApi/AddVertex
 
 {
   "txId": "4",
@@ -19,10 +19,10 @@ GRPC localhost:8000/api.GritApi/AddVertex
 
 ### add vertex
 
-GRPC localhost:8000/api.GritApi/AddVertex
+GRPC localhost:8082/api.GritApi/AddVertex
 
 {
-  "txId": "4",
+  "txId": "2",
   "vertexId": {
     "type": "comp",
     "id": 1234
@@ -48,7 +48,7 @@ GRPC localhost:8000/api.GritApi/AddEdge
 
 ### commit it
 
-GRPC localhost:8000/api.GritApi/Commit
+GRPC localhost:8083/api.GritApi/Commit
 
 {
   "txId": "4"

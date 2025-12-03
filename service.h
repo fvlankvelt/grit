@@ -27,11 +27,13 @@ ptr<buffer> WriteBuffer(T &target) {
 
 class StateMachine : public state_machine {
 public:
-    StateMachine(ptr<Graph> graph) : graph(graph) {
+    StateMachine(ptr<Graph> graph, rocksdb::DB *db) : graph(graph), db(db) {
     }
 
     ptr<buffer> commit(const ulong log_idx, buffer &data) {
-        last_committed_idx_ = log_idx;
+        rocksdb::WriteOptions writeOptions;
+        auto status = db->Put(writeOptions, "state_machine", std::to_string(log_idx));
+        assert(status.ok());
 
         api::RaftLogEntry entry;
         ReadBuffer(entry, data);
@@ -153,7 +155,11 @@ public:
     }
 
     ulong last_commit_index() {
-        return last_committed_idx_;
+        rocksdb::ReadOptions readOptions;
+        std::string value;
+        auto status = db->Get(readOptions, "state_machine", &value);
+        assert(status.ok());
+        return std::stoul(value);
     }
 
     void create_snapshot(snapshot &s,
@@ -169,9 +175,23 @@ private:
         }
     }
 
-    std::atomic<uint64_t> last_committed_idx_;
     ptr<Graph> graph;
+    rocksdb::DB *db;
     std::map<uint64_t, ptr<WriteTransaction> > openTxns;
+};
+
+class Logger : public logger {
+public:
+    void put_details(int level,
+                     const char *source_file,
+                     const char *func_name,
+                     size_t line_number,
+                     const std::string &msg) {
+        // INFO logging
+        if (level <= 4) {
+            std::cout << source_file << " :" << func_name << " (" << line_number << "): " << msg << std::endl;
+        }
+    }
 };
 
 struct RaftPeer {
@@ -182,25 +202,24 @@ struct RaftPeer {
 class Service : public api::GritApi::Service {
 public:
     Service(int id, int raftPort, const ptr<Graph> &graph, std::vector<RaftPeer> peers) : graph(graph) {
-        ptr<logger> my_logger = nullptr;
+        ptr<logger> my_logger = cs_new<Logger>();
         ptr<state_mgr> my_state_manager = cs_new<inmem_state_mgr>(id, "localhost:" +
                                                                       std::to_string(raftPort));
+        auto cluster_config = my_state_manager->load_config();
+        for (auto peer = peers.begin(); peer != peers.end(); ++peer) {
+            ptr<srv_config> peer_conf = cs_new<srv_config>(peer->id, peer->address);
+            cluster_config->get_servers().push_back(peer_conf);
+        }
         asio_service::options asio_opt;
         raft_params params;
+        params.custom_commit_quorum_size_ = peers.size() / 2 + 1;
         params.return_method_ = raft_params::blocking;
+        params.auto_forwarding_ = true;
 
-        my_state_machine_ = cs_new<StateMachine>(graph);
+        my_state_machine_ = cs_new<StateMachine>(graph, graph->GetDB());
         launcher_ = cs_new<raft_launcher>();
         server_ = launcher_->init(my_state_machine_, my_state_manager, my_logger, raftPort,
                                   asio_opt, params);
-        for (auto peer = peers.begin(); peer != peers.end(); ++peer) {
-            if (peer->id == id) {
-                continue;
-            }
-            srv_config srv_conf_to_add(peer->id, peer->address);
-            auto result = server_->add_srv(srv_conf_to_add);
-            assert(result->get_result_code() == cmd_result_code::OK);
-        }
 
         while (!server_->is_initialized()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

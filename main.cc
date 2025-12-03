@@ -12,7 +12,7 @@
 #include "graph.h"
 
 int main() {
-    // std::filesystem::remove_all("/tmp/graphdb");
+    std::filesystem::remove_all("/tmp/graphdb");
     Graph graph("/tmp/graphdb");
     std::unique_ptr<WriteTransaction> createVertex(graph.OpenForWrite());
     VertexId vertexId = {"c", 1};
@@ -34,6 +34,7 @@ int main() {
             std::stringstream ss;
             ss << id.type << ":" << id.id;
             found.insert(ss.str());
+            std::cout << "Vertex by label " << ss.str() << std::endl;
             vertices->Next();
         }
 
@@ -161,6 +162,7 @@ int main() {
 
             int colon = peerStr.find(':');
             int peerId = std::stoi(peerStr.substr(0, colon));
+            std::cout << " ADDING PEER " << peerId << " @ " << peerStr.substr(colon + 1) << std::endl;
             peers.push_back({peerId, peerStr.substr(colon + 1)});
         }
     }

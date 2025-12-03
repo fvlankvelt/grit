@@ -675,7 +675,13 @@ public:
 
     WriteTransaction *OpenForWrite() { return new WriteTransaction(storage, txMgr); }
 
+    friend class Service;
+
 private:
+    rocksdb::DB * GetDB() const {
+        return storage.db;
+    }
+
     std::shared_ptr<TransactionManager> txMgr;
     Storage storage;
     std::unique_ptr<rocksdb::CompactionFilter> compactionFilter;

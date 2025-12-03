@@ -2,25 +2,35 @@ edition = "2023";
 
 package api;
 
-import "google/protobuf/empty.proto";
-
 service GritApi {
 
   // txn management
   rpc OpenTransaction(OpenRequest) returns (Transaction);
-  rpc Commit(Transaction) returns (google.protobuf.Empty);
-  rpc Rollback(Transaction) returns (google.protobuf.Empty);
+  rpc Commit(Transaction) returns (TransactionResponse);
+  rpc Rollback(Transaction) returns (TransactionResponse);
 
   // write operations
-  rpc AddVertex(AddVertexRequest) returns (google.protobuf.Empty);
-  rpc RemoveVertex(RemoveVertexRequest) returns (google.protobuf.Empty);
-  rpc AddLabel(AddLabelRequest) returns (google.protobuf.Empty);
-  rpc RemoveLabel(RemoveLabelRequest) returns (google.protobuf.Empty);
-  rpc AddEdge(AddEdgeRequest) returns (google.protobuf.Empty);
-  rpc RemoveEdge(RemoveEdgeRequest) returns (google.protobuf.Empty);
+  rpc AddVertex(AddVertexRequest) returns (TransactionResponse);
+  rpc RemoveVertex(RemoveVertexRequest) returns (TransactionResponse);
+  rpc AddLabel(AddLabelRequest) returns (TransactionResponse);
+  rpc RemoveLabel(RemoveLabelRequest) returns (TransactionResponse);
+  rpc AddEdge(AddEdgeRequest) returns (TransactionResponse);
+  rpc RemoveEdge(RemoveEdgeRequest) returns (TransactionResponse);
 
   // read operations
   rpc GetVerticesByType(GetVerticesByTypeRequest) returns (stream VertexId);
+}
+
+enum TransactionStatus {
+    OK = 0;
+    IS_READONLY = 1;
+    CONFLICT = 2;
+    INVALIDATED = 3;
+    NOT_IN_PROGRESS = 4;
+}
+
+message TransactionResponse {
+  TransactionStatus status = 1;
 }
 
 enum TransactionType {
@@ -82,4 +92,19 @@ message RemoveEdgeRequest {
 message GetVerticesByTypeRequest {
   uint64 txId = 1;
   string type = 2;
+}
+
+message RaftLogEntry {
+  oneof operation {
+    OpenRequest open = 1;
+    Transaction commit = 2;
+    Transaction rollback = 3;
+
+    AddVertexRequest addVertex = 4;
+    RemoveVertexRequest removeVertex = 5;
+    AddLabelRequest addLabel = 6;
+    RemoveLabelRequest removeLabel = 7;
+    AddEdgeRequest addEdge = 8;
+    RemoveEdgeRequest removeEdge = 9;
+  }
 }

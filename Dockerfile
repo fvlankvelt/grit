@@ -12,6 +12,7 @@ RUN zypper update -y \
     liblz4-devel \
     libzstd-devel \
     protobuf-devel \
+    grpc-devel \
  && touch /usr/lib64/librocksdb.a
 
 COPY . /src/
@@ -22,7 +23,10 @@ RUN cmake --build /build
 FROM opensuse/tumbleweed
 RUN zypper update -y \
  && zypper install -y --no-recommends \
-    librocksdb10
+    librocksdb10 \
+    libgrpc++1_76 \
+    abseil-cpp-devel \
+    libssl59
 WORKDIR /app
 COPY --from=builder /build/Grit /app
 CMD ["/app/Grit"]

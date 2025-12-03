@@ -1,0 +1,25 @@
+services:
+  grit-1:
+    image: grit
+    ports:
+      - "8081:8000"
+      - "8001:8001"
+    environment:
+      RAFT_ID: "1"
+      RAFT_PEERS: "2:localhost:8002,3:localhost:8003"
+  grit-2:
+    image: grit
+    ports:
+      - "8082:8000"
+      - "8002:8001"
+    environment:
+      RAFT_ID: "2"
+      RAFT_PEERS: "1:localhost:8001,3:localhost:8003"
+  grit-3:
+    image: grit
+    ports:
+      - "8083:8000"
+      - "8003:8001"
+    environment:
+      RAFT_ID: "3"
+      RAFT_PEERS: "1:localhost:8001,2:localhost:8002"

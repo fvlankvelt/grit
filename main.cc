@@ -147,5 +147,23 @@ int main() {
         assert(found == expected);
     }
 
-    RunServer(8000, 8001, 0);
+    auto raftIdStr = std::getenv("RAFT_ID");
+    int raftId = raftIdStr ? atoi(raftIdStr) : 0;
+
+    std::vector<RaftPeer> peers;
+    auto raftPeerStr = std::getenv("RAFT_PEERS");
+    if (raftPeerStr) {
+        std::string allPeersStr = raftPeerStr;
+        while (!allPeersStr.empty()) {
+            int comma = allPeersStr.find(",");
+            std::string peerStr = comma > 0 ? allPeersStr.substr(0, comma) : allPeersStr;
+            allPeersStr = comma > 0 ? allPeersStr.substr(comma + 1) : "";
+
+            int colon = peerStr.find(':');
+            int peerId = std::stoi(peerStr.substr(0, colon));
+            peers.push_back({peerId, peerStr.substr(colon + 1)});
+        }
+    }
+
+    RunServer(8000, 8001, raftId, peers);
 }

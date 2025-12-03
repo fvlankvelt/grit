@@ -174,9 +174,14 @@ private:
     std::map<uint64_t, ptr<WriteTransaction> > openTxns;
 };
 
+struct RaftPeer {
+    int id;
+    std::string address;
+};
+
 class Service : public api::GritApi::Service {
 public:
-    Service(int id, int raftPort, const ptr<Graph> &graph) : graph(graph) {
+    Service(int id, int raftPort, const ptr<Graph> &graph, std::vector<RaftPeer> peers) : graph(graph) {
         ptr<logger> my_logger = nullptr;
         ptr<state_mgr> my_state_manager = cs_new<inmem_state_mgr>(id, "localhost:" +
                                                                       std::to_string(raftPort));
@@ -188,6 +193,14 @@ public:
         launcher_ = cs_new<raft_launcher>();
         server_ = launcher_->init(my_state_machine_, my_state_manager, my_logger, raftPort,
                                   asio_opt, params);
+        for (auto peer = peers.begin(); peer != peers.end(); ++peer) {
+            if (peer->id == id) {
+                continue;
+            }
+            srv_config srv_conf_to_add(peer->id, peer->address);
+            auto result = server_->add_srv(srv_conf_to_add);
+            assert(result->get_result_code() == cmd_result_code::OK);
+        }
 
         while (!server_->is_initialized()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -346,9 +359,9 @@ inline void signalHandler(int signum) {
     }
 }
 
-inline void RunServer(int grpcPort, int raftPort, int raftId) {
+inline void RunServer(int grpcPort, int raftPort, int raftId, std::vector<RaftPeer> peers) {
     std::string server_address("0.0.0.0:" + std::to_string(grpcPort));
-    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>("/tmp/graph"));
+    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>("/tmp/graph"), peers);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());

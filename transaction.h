@@ -61,22 +61,16 @@ class TransactionManager {
 public:
     TransactionManager(): db_(nullptr) {}
 
-    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) const {
-        std::shared_lock lock(mutex);
-        uint64_t tx = txId == -1 ? lastWriteTxId + 1 : txId;
-        return std::make_shared<Transaction>(tx, inProgress, invalid, true);
-    }
-
-    bool IsInvalid(uint64_t txId) const {
-        std::shared_lock lock(mutex);
-        return invalid.find(txId) != invalid.end();
-    }
-
     void Initialize(rocksdb::DB* db) {
         db_ = db;
+
+        std::string txStr;
+        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(-1, &txStr));
         rocksdb::ReadOptions options;
+        options.timestamp = &txSlice;
+
         std::string strState;
-        auto status = db->Get(options, "tx_manager_state", &strState);
+        auto status = db->Get(options, "tx_mgr:state", &strState);
         if (status.IsNotFound()) {
             return;
         }
@@ -85,10 +79,6 @@ public:
         storage::TransactionManagerState state;
         state.ParseFromString(strState);
         lastWriteTxId = state.lasttxid();
-        auto inprogress = state.inprogress();
-        for (auto it = inprogress.begin(); it != inprogress.end(); it++) {
-            inProgress.insert(*it);
-        }
         auto inv = state.invalid();
         for (auto it = inv.begin(); it != inv.end(); it++) {
             invalid.insert(*it);
@@ -113,19 +103,32 @@ public:
         }
     }
 
+    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) const {
+        std::shared_lock lock(mutex);
+        uint64_t tx = txId == -1 ? lastWriteTxId : txId;
+        std::set<uint64_t> inProgress = GetInProgress(tx);
+        return std::make_shared<Transaction>(tx, inProgress, invalid, true);
+    }
+
     std::shared_ptr<Transaction> Open() {
         std::unique_lock lock(mutex);
-        lastWriteTxId += 2;
         uint64_t txId = lastWriteTxId;
-        inProgress.insert(txId);
+        std::set<uint64_t> inProgress = GetInProgress(lastWriteTxId);
+        AddInProgress(txId);
         WriteState();
         return std::make_shared<Transaction>(txId, inProgress, invalid, false);
+    }
+
+    bool IsInvalid(uint64_t txId) const {
+        std::shared_lock lock(mutex);
+        return invalid.find(txId) != invalid.end();
     }
 
     void Commit(const Transaction &txn) {
         std::unique_lock lock(mutex);
 
         uint64_t txId = txn.GetTxId();
+        std::set<uint64_t> inProgress = GetInProgress(lastWriteTxId);
         if (inProgress.find(txId) == inProgress.end()) {
             throw TX_NOT_IN_PROGRESS;
         }
@@ -158,27 +161,27 @@ public:
                     throw TX_CONFLICT;
                 }
             }
+
+            // hurray!  No conflicts detected
+            recent.insert(std::pair(txId, txn.touched));
+            WriteTransaction(txn);
+
+            RemoveInProgress(txId);
+            WriteState();
         } catch (TransactionException te) {
-            inProgress.erase(txId);
             invalid.insert(txId);
+            RemoveInProgress(txId);
             WriteState();
             throw;
         }
-
-        // hurray!  No conflicts detected
-        recent.insert(std::pair(txId, txn.touched));
-        inProgress.erase(txId);
-
-        WriteTransaction(txn);
-        WriteState();
     }
 
     void Rollback(uint64_t txId) {
         std::unique_lock lock(mutex);
 
-        inProgress.erase(txId);
         invalid.insert(txId);
 
+        RemoveInProgress(txId);
         WriteState();
     }
 
@@ -207,6 +210,50 @@ public:
     }
 
 private:
+    std::set<uint64_t> GetInProgress(uint64_t txId) const {
+        std::string txStr;
+        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(txId, &txStr));
+
+        rocksdb::ReadOptions options;
+        options.timestamp = &txSlice;
+        std::unique_ptr<rocksdb::Iterator> iter(db_->NewIterator(options));
+
+        std::set<uint64_t> inProgress;
+        iter->Seek("tx_mgr:in_progress:");
+        while (iter->Valid()) {
+            if (!iter->key().starts_with("tx_mgr:in_progress:")) {
+                break;
+            }
+            storage::InProgress value;
+            value.ParseFromString(iter->value().ToString());
+            inProgress.insert(value.txid());
+            iter->Next();
+        }
+        return inProgress;
+    }
+
+    void AddInProgress(uint64_t txId) {
+        lastWriteTxId++;
+        std::stringstream ss;
+        ss << "tx_mgr:in_progress:" << txId;
+        std::string currentTxStr;
+        rocksdb::Slice currentTx(rocksdb::EncodeU64Ts(lastWriteTxId, &currentTxStr));
+        storage::InProgress value;
+        value.set_txid(txId);
+        auto status = db_->Put(rocksdb::WriteOptions(), ss.str(), currentTx, value.SerializeAsString());
+        assert(status.ok());
+    }
+
+    void RemoveInProgress(uint64_t txId) {
+        lastWriteTxId++;
+        std::stringstream ss;
+        ss << "tx_mgr:in_progress:" << txId;
+        std::string currentTxStr;
+        rocksdb::Slice currentTx(rocksdb::EncodeU64Ts(lastWriteTxId, &currentTxStr));
+        auto status = db_->Delete(rocksdb::WriteOptions(), ss.str(), currentTx);
+        assert(status.ok());
+    }
+
     void WriteTransaction(const Transaction &txn) {
         storage::Transaction state;
         state.set_txid(txn.GetTxId());
@@ -217,25 +264,28 @@ private:
             vertexKey->set_id(vid.id);
         }
 
+        std::string currentTxStr;
+        rocksdb::Slice currentTx(rocksdb::EncodeU64Ts(lastWriteTxId, &currentTxStr));
+
         std::stringstream ss;
         ss << "tx:" << txn.GetTxId();
-        auto status = db_->Put(rocksdb::WriteOptions(), ss.str(), state.SerializeAsString());
+        auto status = db_->Put(rocksdb::WriteOptions(), ss.str(), currentTx, state.SerializeAsString());
         assert(status.ok());
     }
 
     void WriteState() const {
         storage::TransactionManagerState state;
         state.set_lasttxid(lastWriteTxId);
-        for (auto it = inProgress.begin(); it != inProgress.end(); it++) {
-            state.add_inprogress(*it);
-        }
         for (auto it = invalid.begin(); it != invalid.end(); it++) {
             state.add_invalid(*it);
         }
         for (auto it = recent.begin(); it != recent.end(); it++) {
             state.add_committed(it->first);
         }
-        auto status = db_->Put(rocksdb::WriteOptions(), "tx_manager_state", state.SerializeAsString());
+        std::string currentTxStr;
+        rocksdb::Slice currentTx(rocksdb::EncodeU64Ts(lastWriteTxId, &currentTxStr));
+
+        auto status = db_->Put(rocksdb::WriteOptions(), "tx_mgr:state", currentTx, state.SerializeAsString());
         assert(status.ok());
     }
 
@@ -252,7 +302,6 @@ private:
 
     uint64_t lastWriteTxId = 0;
     std::map<uint64_t, std::set<VertexId> > recent;
-    std::set<uint64_t> inProgress;
 
     // all rolled back and invalidated transactions - this set can be pruned
     // by a scan (GC) over all data; any updates from invalidated txns are removed

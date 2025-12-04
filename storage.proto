@@ -44,24 +44,6 @@ message MergeValue {
     MergeAction action = 2;
 }
 
-enum TransactionStatus {
-    COMMITTED = 0;
-    IN_PROGRESS = 1;
-    INVALID = 2;
-}
-
-message Transaction {
-    uint64 txId = 1;
-    repeated VertexKey touched = 2;
-}
-
-message TransactionManagerState {
-    uint64 lastTxId = 1;
-    repeated uint64 committed = 2;
-    repeated uint64 inProgress = 3;
-    repeated uint64 invalid = 4;
-}
-
 /**
  * Querying prefixes
  * These are just used to determine prefix length, by relying on the protobuf serialization.
@@ -88,3 +70,21 @@ message EdgeByLabel {
 message EdgeByVertex {
     VertexKey vertex = 1;
 }
+
+// In-progress transactions are put & deleted with the "last write tx open" pointer as user-defined timestamp.
+message InProgress {
+    uint64 txId = 1;
+}
+
+// Committed transactions are written so that conficts can be detected with to-be-committed transactions.
+message Transaction {
+    uint64 txId = 1;
+    repeated VertexKey touched = 2;
+}
+
+message TransactionManagerState {
+    uint64 lastTxId = 1;
+    repeated uint64 committed = 2;
+    repeated uint64 invalid = 4;
+}
+

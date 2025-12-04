@@ -32,7 +32,9 @@ public:
 
     ptr<buffer> commit(const ulong log_idx, buffer &data) {
         rocksdb::WriteOptions writeOptions;
-        auto status = db->Put(writeOptions, "state_machine", std::to_string(log_idx));
+        std::string txStr;
+        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(-1, &txStr));
+        auto status = db->Put(writeOptions, "state_machine", txSlice, std::to_string(log_idx));
         assert(status.ok());
 
         api::RaftLogEntry entry;
@@ -156,8 +158,15 @@ public:
 
     ulong last_commit_index() {
         rocksdb::ReadOptions readOptions;
+        std::string txStr;
+        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(-1, &txStr));
+        readOptions.timestamp = &txSlice;
+
         std::string value;
         auto status = db->Get(readOptions, "state_machine", &value);
+        if (status.IsNotFound()) {
+            return 0;
+        }
         assert(status.ok());
         return std::stoul(value);
     }

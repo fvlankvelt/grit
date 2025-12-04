@@ -22,10 +22,10 @@ using namespace std;
  */
 class TxMergeOperator : public rocksdb::MergeOperator {
 public:
-    TxMergeOperator(const shared_ptr<TransactionManager>& txMgr) : txMgr(txMgr) {
+    TxMergeOperator(const shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
     }
 
-    const char *Name() const { return "TxMergeOperator"; }
+    const char *Name() const override { return "TxMergeOperator"; }
 
     bool FullMergeV2(
         const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
@@ -38,13 +38,9 @@ public:
             merge_out->new_value = value.SerializeAsString();
         }
 
-        // std::cout << "MERGING KEY " << merge_in.key.ToString(true) << std::endl;
-        for (auto it = merge_in.operand_list.rbegin(); it != merge_in.operand_list.rend();
-             it++) {
+        auto operands = merge_in.operand_list;
+        for (auto it = operands.rbegin(); it != operands.rend(); it++) {
             value.ParseFromString(it->ToStringView());
-            // std::cout << "  CHECKING " << value.txid() << " - " << value.action() <<
-            // std::endl;
-
             if (!txMgr->IsInvalid(value.txid())) {
                 merge_out->new_value = it->ToString();
                 break;
@@ -59,7 +55,7 @@ private:
 
 class TxCompactionFilter : public rocksdb::CompactionFilter {
 public:
-    TxCompactionFilter(const std::shared_ptr<TransactionManager>& txMgr) : txMgr(txMgr) {
+    TxCompactionFilter(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
     }
 
     const char *Name() const override { return "TxCompactionFilter"; }
@@ -458,7 +454,7 @@ protected:
 
 class WriteTransaction : public ReadTransaction {
 public:
-    WriteTransaction(const Storage &storage, const std::shared_ptr<TransactionManager>& txMgr)
+    WriteTransaction(const Storage &storage, const std::shared_ptr<TransactionManager> &txMgr)
         : ReadTransaction(storage, txMgr->Open()), txMgr(txMgr) {
         storage::MergeValue value;
         value.set_action(storage::PUT);
@@ -629,7 +625,7 @@ private:
 
 class Graph {
 public:
-    Graph(const std::string &path): txMgr(make_shared<TransactionManager>()) {
+    Graph(const std::string &path) : txMgr(make_shared<TransactionManager>()) {
         rocksdb::Options options;
         options.create_if_missing = true;
         options.create_missing_column_families = true;
@@ -641,7 +637,7 @@ public:
         cfOptions.compaction_filter = compactionFilter.get();
 
         std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor());
+        descriptors.push_back(rocksdb::ColumnFamilyDescriptor(rocksdb::kDefaultColumnFamilyName, cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("index", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("vertices", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("edges", cfOptions));
@@ -678,7 +674,7 @@ public:
     friend class Service;
 
 private:
-    rocksdb::DB * GetDB() const {
+    rocksdb::DB *GetDB() const {
         return storage.db;
     }
 

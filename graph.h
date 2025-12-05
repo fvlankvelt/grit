@@ -85,15 +85,6 @@ private:
     std::shared_ptr<TransactionManager> txMgr;
 };
 
-enum Direction { IN, OUT };
-
-struct Edge {
-    VertexId vertexId;
-    VertexId otherId;
-    std::string label;
-    Direction direction;
-};
-
 struct Storage {
     rocksdb::DB *db;
     rocksdb::ColumnFamilyHandle *_default;
@@ -197,7 +188,7 @@ private:
     bool IsValidKey(const rocksdb::Slice &key) const { return key.starts_with(prefixSlice); }
 
     std::string FluidKey() const {
-        return std::string(fluid->key().data(), fluid->key().size() - 8);
+        return {fluid->key().data(), fluid->key().size() - 8};
     }
 
     std::string currentKey;

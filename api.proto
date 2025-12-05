@@ -18,15 +18,19 @@ service GritApi {
   rpc RemoveEdge(RemoveEdgeRequest) returns (TransactionResponse);
 
   // read operations
+  rpc GetLabels(GetLabelsRequest) returns (stream Label);
+  rpc GetEdges(GetEdgesRequest) returns (stream Edge);
+  rpc GetEdgesByLabel(GetEdgesByLabelRequest) returns (stream Edge);
   rpc GetVerticesByType(GetVerticesByTypeRequest) returns (stream VertexId);
+  rpc GetVerticesByLabel(GetVerticesByLabelRequest) returns (stream VertexId);
 }
 
 enum TransactionStatus {
-    OK = 0;
-    IS_READONLY = 1;
-    CONFLICT = 2;
-    INVALIDATED = 3;
-    NOT_IN_PROGRESS = 4;
+  OK = 0;
+  IS_READONLY = 1;
+  CONFLICT = 2;
+  INVALIDATED = 3;
+  NOT_IN_PROGRESS = 4;
 }
 
 message TransactionResponse {
@@ -89,9 +93,48 @@ message RemoveEdgeRequest {
   VertexId toVertexId = 4;
 }
 
+enum EdgeDirection {
+  IN = 0;
+  OUT = 1;
+}
+
+message Edge {
+  VertexId vertexId = 1;
+  VertexId otherId = 2;
+  string label = 3;
+  EdgeDirection direction = 4;
+}
+
+message Label {
+  string label = 1;
+}
+
 message GetVerticesByTypeRequest {
   uint64 txId = 1;
   string type = 2;
+}
+
+message GetVerticesByLabelRequest {
+  uint64 txId = 1;
+  string label = 2;
+  string type = 3;
+}
+
+message GetLabelsRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+}
+
+message GetEdgesRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+}
+
+message GetEdgesByLabelRequest {
+  uint64 txId = 1;
+  VertexId vertexId = 2;
+  string label = 3;
+  EdgeDirection direction = 4;
 }
 
 message RaftLogEntry {

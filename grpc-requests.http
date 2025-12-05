@@ -97,3 +97,14 @@ GRPC localhost:8002/api.GritApi/GetVerticesByType
   "type": "comp"
 }
 
+### read edges
+
+GRPC localhost:8002/api.GritApi/GetEdges
+
+{
+  "txId": "3",
+  "vertexId": {
+    "type": "comp",
+    "id": "2134"
+  }
+}

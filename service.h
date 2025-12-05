@@ -12,16 +12,39 @@
 
 using namespace nuraft;
 
+class Logger : public logger {
+public:
+    void put_details(int level,
+                     const char *source_file,
+                     const char *func_name,
+                     size_t line_number,
+                     const std::string &msg) {
+        // INFO logging
+        if (level <= 4) {
+            std::cout << level << ": " << source_file << " :" << func_name << " (" << line_number << "): " << msg << std::endl;
+        }
+    }
+};
+
+struct RaftPeer {
+    int id;
+    std::string address;
+};
+
 template<typename T>
 void ReadBuffer(T &target, buffer &buffer) {
-    target.ParseFromArray(buffer.data(), buffer.size());
+    buffer_serializer bs(buffer);
+    size_t size = bs.get_u32();
+    target.ParseFromArray(bs.get_raw(size), size);
 }
 
 template<typename T>
 ptr<buffer> WriteBuffer(T &target) {
     size_t size = target.ByteSizeLong();
-    ptr<buffer> ret = buffer::alloc(size);
-    target.SerializeToArray(ret->data(), size);
+    ptr<buffer> ret = buffer::alloc(size + sizeof(uint32_t));
+    buffer_serializer bs(ret);
+    bs.put_u32(size);
+    target.SerializeToArray(bs.get_raw(size), size);
     return ret;
 }
 
@@ -31,12 +54,15 @@ public:
     }
 
     ptr<buffer> commit(const ulong log_idx, buffer &data) {
+        std::cout << "committing status " << log_idx << std::endl;
+
         rocksdb::WriteOptions writeOptions;
         std::string txStr;
-        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(-1, &txStr));
+        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(log_idx, &txStr));
         auto status = db->Put(writeOptions, "state_machine", txSlice, std::to_string(log_idx));
         assert(status.ok());
 
+        std::cout << "executing " << log_idx << std::endl;
         api::RaftLogEntry entry;
         ReadBuffer(entry, data);
         if (entry.has_open()) {
@@ -164,6 +190,7 @@ public:
 
         std::string value;
         auto status = db->Get(readOptions, "state_machine", &value);
+        std::cout << "last_commit status " << status.ToString() << std::endl;
         if (status.IsNotFound()) {
             return 0;
         }
@@ -187,25 +214,6 @@ private:
     ptr<Graph> graph;
     rocksdb::DB *db;
     std::map<uint64_t, ptr<WriteTransaction> > openTxns;
-};
-
-class Logger : public logger {
-public:
-    void put_details(int level,
-                     const char *source_file,
-                     const char *func_name,
-                     size_t line_number,
-                     const std::string &msg) {
-        // INFO logging
-        if (level <= 4) {
-            std::cout << source_file << " :" << func_name << " (" << line_number << "): " << msg << std::endl;
-        }
-    }
-};
-
-struct RaftPeer {
-    int id;
-    std::string address;
 };
 
 class Service : public api::GritApi::Service {
@@ -248,8 +256,10 @@ public:
         ptr<buffer> log_entry = WriteBuffer(entry);
 
         auto cmd_result = server_->append_entries({log_entry});
-        if (cmd_result->has_result()) {
-            ReadBuffer(*response, *cmd_result->get());
+        if (cmd_result->get_result_code() == OK) {
+            if (cmd_result->has_result()) {
+                ReadBuffer(*response, *cmd_result->get());
+            }
             return grpc::Status::OK;
         }
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "Service unavailable");
@@ -364,7 +374,7 @@ public:
 private:
     grpc::Status Submit(const api::RaftLogEntry &entry, api::TransactionResponse *response) {
         auto cmd_result = server_->append_entries({WriteBuffer(entry)});
-        if (cmd_result->has_result()) {
+        if (cmd_result->get_result_code() == OK && cmd_result->has_result()) {
             ReadBuffer(*response, *cmd_result->get());
             return grpc::Status::OK;
         }
@@ -387,9 +397,9 @@ inline void signalHandler(int signum) {
     }
 }
 
-inline void RunServer(int grpcPort, int raftPort, int raftId, std::vector<RaftPeer> peers) {
+inline void RunServer(int grpcPort, int raftPort, int raftId, std::vector<RaftPeer> peers, const std::string& storagePath) {
     std::string server_address("0.0.0.0:" + std::to_string(grpcPort));
-    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>("/tmp/graph"), peers);
+    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>(storagePath), peers);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());

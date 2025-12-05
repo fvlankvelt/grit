@@ -665,7 +665,7 @@ public:
         storage.db->Close();
     }
 
-    ReadTransaction *OpenForRead(uint64_t txId = -1) {
+    ReadTransaction *OpenForRead(uint64_t txId = 0) {
         return new ReadTransaction(storage, txMgr->OpenForRead(txId));
     }
 

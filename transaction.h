@@ -103,9 +103,9 @@ public:
         }
     }
 
-    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = -1) const {
+    std::shared_ptr<Transaction> OpenForRead(uint64_t txId = 0) const {
         std::shared_lock lock(mutex);
-        uint64_t tx = txId == -1 ? lastWriteTxId : txId;
+        uint64_t tx = txId == 0 ? lastWriteTxId : txId;
         std::set<uint64_t> inProgress = GetInProgress(tx);
         return std::make_shared<Transaction>(tx, inProgress, invalid, true);
     }
@@ -300,7 +300,7 @@ private:
 
     rocksdb::DB * db_;
 
-    uint64_t lastWriteTxId = 0;
+    uint64_t lastWriteTxId = 1;
     std::map<uint64_t, std::set<VertexId> > recent;
 
     // all rolled back and invalidated transactions - this set can be pruned

@@ -1,5 +1,5 @@
 ### open transaction
-GRPC localhost:8000/api.GritApi/OpenTransaction
+GRPC localhost:8001/api.GritApi/OpenTransaction
 
 {
   "type": "WRITE"
@@ -7,7 +7,7 @@ GRPC localhost:8000/api.GritApi/OpenTransaction
 
 ### add vertex
 
-GRPC localhost:8081/api.GritApi/AddVertex
+GRPC localhost:8001/api.GritApi/AddVertex
 
 {
   "txId": "1",
@@ -17,9 +17,9 @@ GRPC localhost:8081/api.GritApi/AddVertex
   }
 }
 
-### add vertex
+### add vertex on OTHER instance
 
-GRPC localhost:8082/api.GritApi/AddVertex
+GRPC localhost:8002/api.GritApi/AddVertex
 
 {
   "txId": "1",
@@ -31,7 +31,7 @@ GRPC localhost:8082/api.GritApi/AddVertex
 
 ### add edge
 
-GRPC localhost:8000/api.GritApi/AddEdge
+GRPC localhost:8001/api.GritApi/AddEdge
 
 {
   "txId": "1",
@@ -46,19 +46,54 @@ GRPC localhost:8000/api.GritApi/AddEdge
   }
 }
 
-### commit it
+### open read tx
 
-GRPC localhost:8000/api.GritApi/Commit
+GRPC localhost:8002/api.GritApi/OpenTransaction
+
+{
+  "type": "READ"
+}
+
+### read vertices before commit
+
+GRPC localhost:8002/api.GritApi/GetVerticesByType
+
+{
+  "txId": "2",
+  "type": "comp"
+}
+
+### commit the mutations
+
+GRPC localhost:8001/api.GritApi/Commit
 
 {
   "txId": "1"
 }
 
-### read
+### open read tx after commit
 
-GRPC localhost:8000/api.GritApi/GetVerticesByType
+GRPC localhost:8002/api.GritApi/OpenTransaction
 
 {
-  "txId": "5",
+  "type": "READ"
+}
+
+### read vertices after commit
+
+GRPC localhost:8002/api.GritApi/GetVerticesByType
+
+{
+  "txId": "3",
   "type": "comp"
 }
+
+### read vertices in original snapshot
+
+GRPC localhost:8002/api.GritApi/GetVerticesByType
+
+{
+  "txId": "2",
+  "type": "comp"
+}
+

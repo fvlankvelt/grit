@@ -113,11 +113,12 @@ public:
 
     std::shared_ptr<Transaction> Open() {
         std::unique_lock db_lock(db_mutex);
-        std::unique_lock lock(invalid_mutex);
         uint64_t txId = lastWriteTxId;
         std::set<uint64_t> inProgress = GetInProgress(lastWriteTxId);
         AddInProgress(txId);
         WriteState();
+
+        std::shared_lock lock(invalid_mutex);
         return std::make_shared<Transaction>(txId, inProgress, invalid, false);
     }
 

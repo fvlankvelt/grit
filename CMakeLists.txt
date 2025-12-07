@@ -15,6 +15,8 @@ find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
 set(STORAGE_DEF ${CMAKE_SOURCE_DIR}/src/storage.proto)
 set(API_DEF ${CMAKE_SOURCE_DIR}/api/api.proto)
 
+set(CMAKE_CXX_STANDARD 20)
+
 # Command to generate C++ files from the proto file
 add_custom_command(
     OUTPUT ${CMAKE_SOURCE_DIR}/generated/storage.pb.cc ${CMAKE_SOURCE_DIR}/generated/storage.pb.h
@@ -55,8 +57,6 @@ add_subdirectory(nuraft)
 
 # Grit
 add_executable(Grit
-        src/graph.h)
-target_sources(Grit PRIVATE
   src/main.cc
   ${CMAKE_SOURCE_DIR}/generated/storage.pb.cc
   ${CMAKE_SOURCE_DIR}/generated/api.pb.cc
@@ -80,7 +80,7 @@ target_link_libraries(Grit PRIVATE
   gRPC::grpc++
   gRPC::grpc++_reflection
 )
-set_property(TARGET Grit PROPERTY CXX_STANDARD 20)
 
 add_dependencies(Grit generate_serialization)
 
+add_subdirectory(test)

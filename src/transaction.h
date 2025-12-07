@@ -104,14 +104,16 @@ public:
     }
 
     std::shared_ptr<Transaction> OpenForRead(uint64_t txId = 0) const {
-        std::shared_lock lock(mutex);
+        std::shared_lock db_lock(db_mutex);
+        std::shared_lock lock(invalid_mutex);
         uint64_t tx = txId == 0 ? lastWriteTxId : txId;
         std::set<uint64_t> inProgress = GetInProgress(tx);
         return std::make_shared<Transaction>(tx, inProgress, invalid, true);
     }
 
     std::shared_ptr<Transaction> Open() {
-        std::unique_lock lock(mutex);
+        std::unique_lock db_lock(db_mutex);
+        std::unique_lock lock(invalid_mutex);
         uint64_t txId = lastWriteTxId;
         std::set<uint64_t> inProgress = GetInProgress(lastWriteTxId);
         AddInProgress(txId);
@@ -120,12 +122,12 @@ public:
     }
 
     bool IsInvalid(uint64_t txId) const {
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(invalid_mutex);
         return invalid.find(txId) != invalid.end();
     }
 
     void Commit(const Transaction &txn) {
-        std::unique_lock lock(mutex);
+        std::unique_lock db_lock(db_mutex);
 
         uint64_t txId = txn.GetTxId();
         std::set<uint64_t> inProgress = GetInProgress(lastWriteTxId);
@@ -138,8 +140,7 @@ public:
             // that have been committed since its start.
             for (auto it = txn.inProgress.begin(); it != txn.inProgress.end(); it++) {
                 uint64_t inPTxId = *it;
-                if (inProgress.find(inPTxId) != inProgress.end() ||
-                    invalid.find(inPTxId) != invalid.end()) {
+                if (inProgress.find(inPTxId) != inProgress.end() || IsInvalid(inPTxId)) {
                     continue;
                 }
                 if (recent.find(inPTxId) == recent.end()) {
@@ -165,11 +166,13 @@ public:
             // hurray!  No conflicts detected
             recent.insert(std::pair(txId, txn.touched));
             WriteTransaction(txn);
-
             RemoveInProgress(txId);
             WriteState();
         } catch (TransactionException te) {
-            invalid.insert(txId);
+            {
+                std::unique_lock lock(invalid_mutex);
+                invalid.insert(txId);
+            }
             RemoveInProgress(txId);
             WriteState();
             throw;
@@ -177,10 +180,11 @@ public:
     }
 
     void Rollback(uint64_t txId) {
-        std::unique_lock lock(mutex);
-
-        invalid.insert(txId);
-
+        std::unique_lock db_lock(db_mutex);
+        {
+            std::unique_lock lock(invalid_mutex);
+            invalid.insert(txId);
+        }
         RemoveInProgress(txId);
         WriteState();
     }
@@ -190,7 +194,7 @@ public:
      * This will abort any transactions that started before expireTx.
      */
     void Advance(uint64_t expireTx) {
-        std::unique_lock lock(mutex);
+        std::unique_lock lock(db_mutex);
 
         rocksdb::WriteOptions writeOptions;
         for (auto it = recent.begin(); it != recent.end();) {
@@ -276,8 +280,11 @@ private:
     void WriteState() const {
         storage::TransactionManagerState state;
         state.set_lasttxid(lastWriteTxId);
-        for (auto it = invalid.begin(); it != invalid.end(); it++) {
-            state.add_invalid(*it);
+        {
+            std::shared_lock lock(invalid_mutex);
+            for (auto it = invalid.begin(); it != invalid.end(); it++) {
+                state.add_invalid(*it);
+            }
         }
         for (auto it = recent.begin(); it != recent.end(); it++) {
             state.add_committed(it->first);
@@ -296,7 +303,10 @@ private:
         return out.begin() != out.end();
     }
 
-    mutable std::shared_mutex mutex;
+    // guard for invalid list - it is used a lot from merge operator to validate entries
+    mutable std::shared_mutex invalid_mutex;
+    // guard for rest of state
+    mutable std::shared_mutex db_mutex;
 
     rocksdb::DB * db_;
 

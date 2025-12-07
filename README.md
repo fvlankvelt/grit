@@ -1,8 +1,7 @@
 GRaph In Time (GRIT)
 ==
 
-Uses RocksDB as backend to implement a time-travelling graph database.
-At this moment mostly in the design phase - hopefully this changes soon.
+A highly available time-travelling graph database.
 
 Vertices, Edges and Indices
 ===

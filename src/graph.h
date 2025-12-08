@@ -4,15 +4,24 @@
 #include <memory>
 #include <sstream>
 
+#include "encoding.h"
 #include "graph.h"
 #include "model.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/db.h"
 #include "rocksdb/merge_operator.h"
-#include "storage.pb.h"
 #include "transaction.h"
 
 using namespace std;
+
+const std::string ToHex(const rocksdb::Slice& slice) {
+    std::stringstream ss;
+    ss << "0x";
+    for (int i = 0; i < slice.size(); i++) {
+        ss << std::format("{:02x}", slice.data()[i]);
+    }
+    return ss.str();
+}
 
 /**
  * Merge updates to a key, filtering out those created by invalid transactions.
@@ -28,19 +37,19 @@ public:
 
     bool FullMergeV2(
         const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
-        storage::MergeValue value;
+        MergeValue value;
         if (merge_in.existing_value) {
             merge_out->new_value = merge_in.existing_value->ToString(false);
         } else {
-            value.set_action(storage::DELETE);
-            value.set_txid(0);
-            merge_out->new_value = value.SerializeAsString();
+            value.action = DELETE;
+            value.txId = 0;
+            merge_out->new_value = encoding().put_merge(value).ToString();
         }
 
         auto operands = merge_in.operand_list;
         for (auto it = operands.rbegin(); it != operands.rend(); it++) {
-            value.ParseFromString(it->ToStringView());
-            if (!txMgr->IsInvalid(value.txid())) {
+            encoding(*it).get_merge(value);
+            if (!txMgr->IsInvalid(value.txId)) {
                 merge_out->new_value = it->ToString();
                 break;
             }
@@ -65,19 +74,19 @@ public:
         const rocksdb::Slice &existing_value,
         std::string *new_value,
         bool *value_changed) const override {
-        storage::MergeValue value;
-        value.ParseFromString(existing_value.ToStringView());
+        MergeValue value;
+        encoding(existing_value).get_merge(value);
 
         // what to do in this case?
-        assert(!txMgr->IsInvalid(value.txid()));
-        return value.action() == storage::DELETE;
+        assert(!txMgr->IsInvalid(value.txId));
+        return value.action == DELETE;
     }
 
     bool FilterMergeOperand(
         int level, const rocksdb::Slice &key, const rocksdb::Slice &operand) const override {
-        storage::MergeValue value;
-        value.ParseFromString(operand.ToStringView());
-        return txMgr->IsInvalid(value.txid());
+        MergeValue value;
+        encoding(operand).get_merge(value);
+        return txMgr->IsInvalid(value.txId);
     }
 
 private:
@@ -101,9 +110,9 @@ public:
         // (multiple updates per key)
         rocksdb::Iterator *frozen, // time-travel iterator that only contains historic data
         // (one entry per key)
-        const std::string &prefix,
+        const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : txn(txn), prefixStr(prefix), prefixSlice(prefixStr), fluid(fluid), frozen(frozen) {
+        : txn(txn), prefixStr(prefix.data(), prefix.size()), prefixSlice(prefixStr), fluid(fluid), frozen(frozen) {
         comparator = rocksdb::BytewiseComparatorWithU64Ts();
     }
 
@@ -132,10 +141,10 @@ public:
             }
 
             uint64_t keyTxId;
-            storage::MergeValue value;
+            MergeValue value;
             if (cmp > 0) {
-                value.ParseFromString(frozen->value().ToStringView());
-                keyTxId = value.txid();
+                encoding(frozen->value()).get_merge(value);
+                keyTxId = value.txId;
                 DecodeU64Ts(fluid->timestamp(), &keyTxId);
                 if (txn->IsExcluded(keyTxId)) {
                     frozen->Next();
@@ -144,8 +153,8 @@ public:
                 currentKey = frozen->key().ToString();
                 assert(frozen->key().ToString().compare(currentKey) == 0);
             } else {
-                value.ParseFromString(fluid->value().ToStringView());
-                keyTxId = value.txid();
+                encoding(fluid->value()).get_merge(value);
+                keyTxId = value.txId;
                 if (txn->IsExcluded(keyTxId)) {
                     fluid->Next();
                     continue;
@@ -156,7 +165,7 @@ public:
             }
 
             // don't report deleted keys
-            if (value.action() == storage::PUT) {
+            if (value.action == PUT) {
                 populate(currentKey);
                 foundKey = true;
             }
@@ -204,7 +213,7 @@ public:
     VertexIterator(
         rocksdb::Iterator *fluid,
         rocksdb::Iterator *frozen,
-        const std::string &prefix,
+        const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
         fluid->Seek(prefix);
@@ -214,13 +223,7 @@ public:
 
 protected:
     void populate(const rocksdb::Slice &keySlice) {
-        storage::VertexKey key;
-        key.ParseFromString(keySlice.ToStringView());
-
-        current = VertexId{
-            key.type(),
-            key.id(),
-        };
+        encoding(keySlice).get_vertex(current);
     }
 
     std::string ToString(VertexId id) {
@@ -235,7 +238,7 @@ public:
     IndexVertexIterator(
         rocksdb::Iterator *fluid,
         rocksdb::Iterator *frozen,
-        const std::string &prefix,
+        const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
         fluid->Seek(prefix);
@@ -245,13 +248,10 @@ public:
 
 protected:
     void populate(const rocksdb::Slice &keySlice) {
-        storage::IndexKey key;
-        key.ParseFromString(keySlice.ToStringView());
-
-        current = VertexId{
-            key.vertex().type(),
-            key.vertex().id(),
-        };
+        std::string label;
+        encoding(keySlice)
+                .get_string(label)
+                .get_vertex(current);
     }
 
     std::string ToString(VertexId id) {
@@ -266,7 +266,7 @@ public:
     LabelIterator(
         rocksdb::Iterator *fluid,
         rocksdb::Iterator *frozen,
-        const std::string &prefix,
+        const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
         fluid->Seek(prefix);
@@ -276,9 +276,7 @@ public:
 
 protected:
     void populate(const rocksdb::Slice &keySlice) {
-        storage::LabelKey key;
-        key.ParseFromString(keySlice.ToStringView());
-        current = key.label();
+        encoding(keySlice).get_string(current);
     }
 
     std::string ToString(std::string current) { return current; }
@@ -289,7 +287,7 @@ public:
     EdgeIterator(
         rocksdb::Iterator *fluid,
         rocksdb::Iterator *frozen,
-        const std::string &prefix,
+        const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
         fluid->Seek(prefix);
@@ -299,14 +297,7 @@ public:
 
 protected:
     void populate(const rocksdb::Slice &keySlice) {
-        storage::EdgeKey key;
-        key.ParseFromString(keySlice.ToStringView());
-        current = Edge{
-            VertexId{key.vertex().type(), key.vertex().id()},
-            VertexId{key.other().type(), key.other().id()},
-            key.label(),
-            key.direction() == storage::Direction::IN ? IN : OUT
-        };
+        encoding(keySlice).get_edge(current);
     }
 
     std::string ToString(Edge edge) {
@@ -337,96 +328,43 @@ public:
     uint64_t GetTxId() const { return txn->GetTxId(); }
 
     VertexIterator *GetVerticesByType(const std::string &type) {
-        storage::VertexKey key;
-        key.set_type(type);
-        std::string firstKey = key.SerializeAsString();
-
-        storage::VertexByType vbt;
-        vbt.set_type(type);
-        std::string trimmed = vbt.SerializeAsString();
-
         return new VertexIterator(
             storage.db->NewIterator(fluidReadOptions, storage.vertices),
             storage.db->NewIterator(frozenReadOptions, storage.vertices),
-            firstKey.substr(0, trimmed.size()),
+            encoding().put_string(type).ToSlice(),
             txn);
     }
 
     IndexVertexIterator *GetVerticesByLabel(const std::string &label, const std::string &type) {
-        storage::IndexKey key;
-        key.set_label(label);
-        key.mutable_vertex()->set_type(type);
-        key.mutable_vertex()->set_id(0);
-        std::string firstKey = key.SerializeAsString();
-
-        storage::IndexVertexByType ivbt;
-        ivbt.set_label(label);
-        ivbt.mutable_vertexbytype()->set_type(type);
-        std::string trimmed = ivbt.SerializeAsString();
-
         return new IndexVertexIterator(
             storage.db->NewIterator(fluidReadOptions, storage.index),
             storage.db->NewIterator(frozenReadOptions, storage.index),
-            firstKey.substr(0, trimmed.size()),
+            encoding().put_string(label).put_string(type).ToSlice(),
             txn);
     }
 
     LabelIterator *GetLabels(const VertexId &vertexId) const {
-        storage::LabelKey key;
-        key.mutable_vertex()->set_type(vertexId.type);
-        key.mutable_vertex()->set_id(vertexId.id);
-        std::string firstKey = key.SerializeAsString();
-
-        storage::LabelByVertex ivbt;
-        ivbt.mutable_vertex()->set_type(vertexId.type);
-        ivbt.mutable_vertex()->set_id(vertexId.id);
-        std::string trimmed = ivbt.SerializeAsString();
-
         return new LabelIterator(
             storage.db->NewIterator(fluidReadOptions, storage.labels),
             storage.db->NewIterator(frozenReadOptions, storage.labels),
-            firstKey.substr(0, trimmed.size()),
+            encoding().put_vertex(vertexId).ToSlice(),
             txn);
     }
 
     EdgeIterator *GetEdges(
         const VertexId &vertexId, const std::string &label, const Direction direction) const {
-        storage::EdgeKey edge;
-        edge.mutable_vertex()->set_type(vertexId.type);
-        edge.mutable_vertex()->set_id(vertexId.id);
-        edge.set_label(label);
-        edge.set_direction(direction == IN ? storage::Direction::IN : storage::Direction::OUT);
-        std::string firstKey = edge.SerializeAsString();
-
-        storage::EdgeByLabel ebl;
-        ebl.mutable_vertex()->set_type(vertexId.type);
-        ebl.mutable_vertex()->set_id(vertexId.id);
-        ebl.set_label(label);
-        ebl.set_direction(direction == IN ? storage::Direction::IN : storage::Direction::OUT);
-        std::string trimmed = ebl.SerializeAsString();
-
         return new EdgeIterator(
             storage.db->NewIterator(fluidReadOptions, storage.edges),
             storage.db->NewIterator(frozenReadOptions, storage.edges),
-            firstKey.substr(0, trimmed.size()),
+            encoding().put_vertex(vertexId).put_string(label).put_direction(direction).ToSlice(),
             txn);
     }
 
     EdgeIterator *GetEdges(const VertexId &vertexId) const {
-        storage::EdgeKey edge;
-        edge.mutable_vertex()->set_type(vertexId.type);
-        edge.mutable_vertex()->set_id(vertexId.id);
-        std::string firstKey = edge.SerializeAsString();
-
-        storage::EdgeByVertex ebv;
-        ebv.mutable_vertex()->set_type(vertexId.type);
-        ebv.mutable_vertex()->set_id(vertexId.id);
-        std::string trimmed = ebv.SerializeAsString();
-
         return new EdgeIterator(
             storage.db->NewIterator(fluidReadOptions, storage.edges),
             storage.db->NewIterator(frozenReadOptions, storage.edges),
-            firstKey.substr(0, trimmed.size()),
+            encoding().put_vertex(vertexId).ToSlice(),
             txn);
     }
 
@@ -446,32 +384,26 @@ class WriteTransaction : public ReadTransaction {
 public:
     WriteTransaction(const Storage &storage, const std::shared_ptr<TransactionManager> &txMgr)
         : ReadTransaction(storage, txMgr->Open()), txMgr(txMgr) {
-        storage::MergeValue value;
-        value.set_action(storage::PUT);
-        value.set_txid(txn->GetTxId());
-        putStr = value.SerializeAsString();
-        value.set_action(storage::DELETE);
-        deleteStr = value.SerializeAsString();
+        MergeValue put;
+        put.action = PUT;
+        put.txId = txn->GetTxId();
+        putEnc = encoding().put_merge(put);
+        MergeValue del;
+        del.action = DELETE;
+        del.txId = txn->GetTxId();
+        delEnc = encoding().put_merge(del);
     }
 
     virtual bool IsReadOnly() { return false; }
 
     void AddVertex(const VertexId &vertexId) const {
-        storage::VertexKey key;
-        key.set_type(vertexId.type);
-        key.set_id(vertexId.id);
-
         rocksdb::Status status =
-                storage.db->Merge(wo, storage.vertices, key.SerializeAsString(), tx, putStr);
+                storage.db->Merge(wo, storage.vertices, encoding().put_vertex(vertexId).ToSlice(), tx, putEnc.ToSlice());
         assert(status.ok());
     }
 
     void RemoveVertex(const VertexId &vertexId) const {
         txn->Touch(vertexId);
-
-        storage::VertexKey key;
-        key.set_type(vertexId.type);
-        key.set_id(vertexId.id);
 
         const std::unique_ptr<EdgeIterator> edges(GetEdges(vertexId));
         while (edges->Valid()) {
@@ -492,53 +424,50 @@ public:
         }
 
         const rocksdb::Status status =
-                storage.db->Merge(wo, storage.vertices, key.SerializeAsString(), tx, deleteStr);
+                storage.db->Merge(wo, storage.vertices, encoding().put_vertex(vertexId).ToSlice(), tx, delEnc.ToSlice());
         assert(status.ok());
     }
 
     void AddLabel(const VertexId &vertexId, const std::string &label) const {
-        storage::IndexKey indexKey;
-        indexKey.set_label(label);
-        storage::VertexKey *vertexKey = indexKey.mutable_vertex();
-        vertexKey->set_type(vertexId.type);
-        vertexKey->set_id(vertexId.id);
-
         txn->Touch(vertexId);
         rocksdb::Status status =
-                storage.db->Merge(wo, storage.index, indexKey.SerializeAsString(), tx, putStr);
+                storage.db->Merge(wo, storage.index,
+                                  encoding()
+                                  .put_string(label)
+                                  .put_vertex(vertexId)
+                                  .ToSlice(),
+                                  tx, putEnc.ToSlice());
         assert(status.ok());
 
-        storage::LabelKey labelKey;
-        labelKey.set_label(label);
-        vertexKey = labelKey.mutable_vertex();
-        vertexKey->set_type(vertexId.type);
-        vertexKey->set_id(vertexId.id);
-
         status =
-                storage.db->Merge(wo, storage.labels, labelKey.SerializeAsString(), tx, putStr);
+                storage.db->Merge(wo, storage.labels,
+                                  encoding()
+                                  .put_vertex(vertexId)
+                                  .put_string(label)
+                                  .ToSlice(),
+                                  tx, putEnc.ToSlice());
         assert(status.ok());
     }
 
     void RemoveLabel(const VertexId &vertexId, const std::string label) const {
-        storage::IndexKey key;
-        key.set_label(label);
-        storage::VertexKey *vertexKey = key.mutable_vertex();
-        vertexKey->set_type(vertexId.type);
-        vertexKey->set_id(vertexId.id);
-
         txn->Touch(vertexId);
         rocksdb::Status status =
-                storage.db->Merge(wo, storage.index, key.SerializeAsString(), tx, deleteStr);
+                storage.db->Merge(wo, storage.index,
+                                  encoding()
+                                  .put_string(label)
+                                  .put_vertex(vertexId)
+                                  .ToSlice(),
+                                  tx, delEnc.ToSlice());
         assert(status.ok());
 
-        storage::LabelKey labelKey;
-        labelKey.set_label(label);
-        vertexKey = labelKey.mutable_vertex();
-        vertexKey->set_type(vertexId.type);
-        vertexKey->set_id(vertexId.id);
-
         status =
-                storage.db->Merge(wo, storage.labels, labelKey.SerializeAsString(), tx, deleteStr);
+                storage.db->Merge(wo, storage.labels,
+                                  encoding()
+                                  .put_vertex(vertexId)
+                                  .put_string(label)
+                                  .ToSlice(),
+                                  tx, delEnc.ToSlice());
+        assert(status.ok());
     }
 
     void AddEdge(const std::string &label, const VertexId &from, const VertexId &to) const {
@@ -568,20 +497,10 @@ private:
         const Direction direction,
         const VertexId &vertex,
         const VertexId &other) const {
-        storage::EdgeKey key;
-        key.set_label(label);
-        key.set_direction(direction == OUT ? storage::Direction::OUT : storage::Direction::IN);
-
-        storage::VertexKey *vertexKey = key.mutable_vertex();
-        vertexKey->set_type(vertex.type);
-        vertexKey->set_id(vertex.id);
-
-        storage::VertexKey *otherKey = key.mutable_other();
-        otherKey->set_type(other.type);
-        otherKey->set_id(other.id);
-
         rocksdb::Status status =
-                storage.db->Merge(wo, storage.edges, key.SerializeAsString(), tx, putStr);
+                storage.db->Merge(wo, storage.edges,
+                                  encoding().put_edge({vertex, other, label, direction}).ToSlice(),
+                                  tx, putEnc.ToSlice());
         assert(status.ok());
     }
 
@@ -590,25 +509,15 @@ private:
         const Direction direction,
         const VertexId &vertex,
         const VertexId &other) const {
-        storage::EdgeKey key;
-        key.set_label(label);
-        key.set_direction(direction == OUT ? storage::Direction::OUT : storage::Direction::IN);
-
-        storage::VertexKey *vertexKey = key.mutable_vertex();
-        vertexKey->set_type(vertex.type);
-        vertexKey->set_id(vertex.id);
-
-        storage::VertexKey *otherKey = key.mutable_other();
-        otherKey->set_type(other.type);
-        otherKey->set_id(other.id);
-
         rocksdb::Status status =
-                storage.db->Merge(wo, storage.edges, key.SerializeAsString(), tx, deleteStr);
+                storage.db->Merge(wo, storage.edges,
+                                  encoding().put_edge({vertex, other, label, direction}).ToSlice(),
+                                  tx, delEnc.ToSlice());
         assert(status.ok());
     }
 
-    std::string putStr;
-    std::string deleteStr;
+    encoding putEnc;
+    encoding delEnc;
     std::shared_ptr<TransactionManager> txMgr;
     rocksdb::WriteOptions wo;
 };

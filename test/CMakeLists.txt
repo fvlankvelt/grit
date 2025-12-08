@@ -36,3 +36,8 @@ unit_test(NAME test_edge
         SOURCES
         test.cc
 )
+
+unit_test(NAME test_performance
+        SOURCES
+        test_performance.cc
+)

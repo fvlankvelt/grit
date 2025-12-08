@@ -4,7 +4,7 @@
 
 struct VertexId {
     std::string type;
-    long id;
+    unsigned long id;
 };
 
 constexpr bool operator<(const VertexId& a, const VertexId& b) {
@@ -19,4 +19,11 @@ struct Edge {
     VertexId otherId;
     std::string label;
     Direction direction;
+};
+
+enum Action { PUT, DELETE};
+
+struct MergeValue {
+    Action action;
+    unsigned long txId;
 };

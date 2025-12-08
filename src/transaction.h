@@ -97,7 +97,9 @@ public:
             std::set<VertexId> touched;
             auto vertex_keys = tx.touched();
             for (auto key = vertex_keys.begin(); key != vertex_keys.end(); key++) {
-                touched.insert({key->type(), key->id()});
+                VertexId vid;
+                encoding(*key).get_vertex(vid);
+                touched.insert(vid);
             }
             recent.insert(std::pair(tx.txid(), touched));
         }
@@ -264,9 +266,8 @@ private:
         state.set_txid(txn.GetTxId());
         for (auto it = txn.touched.begin(); it != txn.touched.end(); it++) {
             const VertexId& vid = *it;
-            storage::VertexKey* vertexKey = state.add_touched();
-            vertexKey->set_type(vid.type);
-            vertexKey->set_id(vid.id);
+            std::string* vertexKey = state.add_touched();
+            *vertexKey = encoding().put_vertex(vid).ToString();
         }
 
         std::string currentTxStr;

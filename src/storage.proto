@@ -3,74 +3,6 @@ edition = "2023";
 
 package storage;
 
-/**
- * Field order also determines key sorting.
- * Keys are sorted bytewise, which should work out fine for protobuf since fields are serialized sequentially.
- */
-message VertexKey {
-    string type = 1;
-    int64 id = 2;
-}
-
-message IndexKey {
-    string label = 1;
-    VertexKey vertex = 2;
-}
-
-message LabelKey {
-    VertexKey vertex = 1;
-    string label = 2;
-}
-
-enum Direction {
-    IN = 0;
-    OUT = 1;
-}
-
-message EdgeKey {
-    VertexKey vertex = 1;
-    string label = 2;
-    Direction direction = 3;
-    VertexKey other = 4;
-}
-
-enum MergeAction {
-    PUT = 0;
-    DELETE = 1;
-}
-
-message MergeValue {
-    uint64 txId = 1;             // for merge operator - it only gets to see values
-    MergeAction action = 2;
-}
-
-/**
- * Querying prefixes
- * These are just used to determine prefix length, by relying on the protobuf serialization.
- */
-message VertexByType {
-    string type = 1;
-}
-
-message IndexVertexByType {
-    string label = 1;
-    VertexByType vertexByType = 2;
-}
-
-message LabelByVertex {
-    VertexKey vertex = 1;
-}
-
-message EdgeByLabel {
-    VertexKey vertex = 1;
-    string label = 2;
-    Direction direction = 3;
-}
-
-message EdgeByVertex {
-    VertexKey vertex = 1;
-}
-
 // In-progress transactions are put & deleted with the "last write tx open" pointer as user-defined timestamp.
 message InProgress {
     uint64 txId = 1;
@@ -79,7 +11,7 @@ message InProgress {
 // Committed transactions are written so that conficts can be detected with to-be-committed transactions.
 message Transaction {
     uint64 txId = 1;
-    repeated VertexKey touched = 2;
+    repeated bytes touched = 2;
 }
 
 message TransactionManagerState {

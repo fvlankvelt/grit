@@ -10,7 +10,10 @@
 #include "in_memory_state_mgr.hxx"
 #include "libnuraft/nuraft.hxx"
 
+#define SNAPSHOT_BUFFER_SIZE 16384
+
 using namespace nuraft;
+
 
 class Logger : public logger {
 public:
@@ -51,17 +54,20 @@ ptr<buffer> WriteBuffer(T &target) {
 
 class StateMachine : public state_machine {
 public:
-    StateMachine(ptr<Graph> graph, rocksdb::DB *db) : graph(graph), db(db) {
+    StateMachine(ptr<Graph> graph) : graph(graph) {
     }
 
     ptr<buffer> commit(const ulong log_idx, buffer &data) {
         std::cout << "committing status " << log_idx << std::endl;
 
-        rocksdb::WriteOptions writeOptions;
-        std::string txStr;
-        rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(log_idx, &txStr));
-        auto status = db->Put(writeOptions, "state_machine", txSlice, std::to_string(log_idx));
-        assert(status.ok());
+        {
+            unique_ptr<ReadTransaction> txn(graph->OpenForRead());
+            rocksdb::WriteOptions writeOptions;
+            std::string txStr;
+            rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(txn->GetTxId(), &txStr));
+            auto status = graph->GetStorage().db->Put(writeOptions, "state_machine", txSlice, std::to_string(log_idx));
+            assert(status.ok());
+        }
 
         std::cout << "executing " << log_idx << std::endl;
         api::RaftLogEntry entry;
@@ -190,7 +196,7 @@ public:
         readOptions.timestamp = &txSlice;
 
         std::string value;
-        auto status = db->Get(readOptions, "state_machine", &value);
+        auto status = graph->GetStorage().db->Get(readOptions, "state_machine", &value);
         std::cout << "last_commit status " << status.ToString() << std::endl;
         if (status.IsNotFound()) {
             return 0;
@@ -203,7 +209,180 @@ public:
                          async_result<bool>::handler_type &when_done) {
     }
 
+    int read_logical_snp_obj(snapshot &s, void *&user_snp_ctx, ulong obj_id, ptr<buffer> &data_out,
+                             bool &is_last_obj) override {
+        if (obj_id == 0) {
+            return 0;
+        }
+        if (user_snp_ctx == nullptr) {
+            data_out = buffer::expand(*data_out, 8);
+            rocksdb::ReadOptions readOptions;
+            unique_ptr<ReadTransaction> txn(graph->OpenForRead());
+            user_snp_ctx = new SnapshotContext(graph, obj_id, txn->GetTxId());
+        }
+        SnapshotContext *ctx = static_cast<SnapshotContext *>(user_snp_ctx);
+        if (ctx->Read(data_out)) {
+            is_last_obj = true;
+        }
+        return 0;
+    }
+
+    void save_logical_snp_obj(snapshot &s, ulong &obj_id, buffer &data, bool is_first_obj, bool is_last_obj) override {
+        if (obj_id == 0) {
+            std::unique_ptr<ReadTransaction> txn(graph->OpenForRead());
+            obj_id = txn->GetFluidTxId();
+            return;
+        }
+        WriteSnapshotBuffer(data);
+        obj_id++;
+    }
+
+    void free_user_snp_ctx(void *&user_snp_ctx) override {
+        delete static_cast<SnapshotContext *>(user_snp_ctx);
+    }
+
 private:
+    enum ColumnFamilyCell {
+        NONE = 0,
+        VERTICES = 1,
+        EDGES = 2,
+        LABELS = 3,
+        INDEX = 4,
+        DEFAULT = 5,
+    };
+
+    class SnapshotContext {
+    public:
+        SnapshotContext(
+            const ptr<Graph> &graph,
+            uint64_t startTxId,
+            uint64_t txId
+        ) : graph(graph),
+            tx(rocksdb::EncodeU64Ts(txId, &str_ts)),
+            start_tx(rocksdb::EncodeU64Ts(startTxId, &str_start_tx)) {
+            rocksdb::ReadOptions readOptions;
+            readOptions.timestamp = &tx;
+            readOptions.iter_start_ts = &start_tx;
+
+            const Storage &storage = graph->GetStorage();
+            vertices.reset(storage.db->NewIterator(readOptions, storage.vertices));
+            vertices->SeekToLast();
+            edges.reset(storage.db->NewIterator(readOptions, storage.edges));
+            edges->SeekToLast();
+            labels.reset(storage.db->NewIterator(readOptions, storage.labels));
+            labels->SeekToLast();
+            index.reset(storage.db->NewIterator(readOptions, storage.index));
+            index->SeekToLast();
+            _default.reset(storage.db->NewIterator(readOptions, storage._default));
+            _default->SeekToLast();
+        }
+
+        bool Read(ptr<buffer> &data_out) {
+            data_out = buffer::expand(*data_out, SNAPSHOT_BUFFER_SIZE);
+            return ReadIterator(vertices, data_out, VERTICES)
+                   && ReadIterator(edges, data_out, EDGES)
+                   && ReadIterator(labels, data_out, LABELS)
+                   && ReadIterator(index, data_out, INDEX)
+                   && ReadIterator(_default, data_out, DEFAULT);
+        }
+
+    private:
+        ptr<rocksdb::Iterator> vertices;
+        ptr<rocksdb::Iterator> edges;
+        ptr<rocksdb::Iterator> labels;
+        ptr<rocksdb::Iterator> index;
+        ptr<rocksdb::Iterator> _default;
+
+        ptr<Graph> graph;
+        std::string str_ts;
+        rocksdb::Slice tx;
+        std::string str_start_tx;
+        rocksdb::Slice start_tx;
+    };
+
+    enum ValueType {
+        DELETE = 0,
+        PUT = 1,
+        MERGE = 2
+    };
+
+    static bool ReadIterator(ptr<rocksdb::Iterator> iter, ptr<buffer> &data_out, ColumnFamilyCell cell) {
+        while (iter->Valid()) {
+            auto key = iter->key();
+            auto value = iter->value();
+
+            // UNSAFE VALUE TYPE DETERMINATION
+            nuraft::byte valueType = key.data()[key.size() + 8 - 1];
+            assert(valueType == DELETE || valueType == PUT || valueType == MERGE);
+
+            // check for 2 byte extra for the "continue" flag
+            // 1 to write this entry, 1 to write the last "end" marker
+            uint size = 3 + key.size() + value.size() + 2 * sizeof(uint32_t);
+            if (data_out->size() - data_out->pos() < size) {
+                nuraft::byte done = NONE;
+                data_out->put(done);
+                return false;
+            }
+            nuraft::byte done = cell;
+            data_out->put(done);
+            data_out->put(valueType);
+            data_out->put(key.data(), key.size());
+            data_out->put(value.data(), value.size());
+            iter->Prev();
+        }
+        return true;
+    }
+
+    void WriteSnapshotBuffer(buffer &buffer) {
+        auto storage = graph->GetStorage();
+        do {
+            nuraft::byte byte = buffer.get_byte();
+            rocksdb::ColumnFamilyHandle *handle;
+            switch (byte) {
+                case VERTICES:
+                    handle = storage.vertices;
+                    break;
+                case EDGES:
+                    handle = storage.edges;
+                    break;
+                case LABELS:
+                    handle = storage.labels;
+                    break;
+                case INDEX:
+                    handle = storage.index;
+                    break;
+                case DEFAULT:
+                    handle = storage._default;
+                    break;
+                case NONE:
+                default:
+                    return;
+            }
+
+            ValueType vt = static_cast<ValueType>(buffer.get_byte());
+
+            size_t keySize = buffer.get_int();
+            rocksdb::Slice keyWithTx(reinterpret_cast<const char *>(buffer.get_bytes(keySize)), keySize);
+            rocksdb::Slice key(keyWithTx.data(), keySize - 8);
+            rocksdb::Slice tx(keyWithTx.data() + keySize - 8, 8);
+
+            size_t valueSize = buffer.get_int();
+            rocksdb::Slice value(reinterpret_cast<const char *>(buffer.get_bytes(valueSize)), valueSize);
+
+            switch (vt) {
+                case MERGE:
+                    storage.db->Merge(rocksdb::WriteOptions(), handle, key, tx, value);
+                    break;
+                case PUT:
+                    storage.db->Put(rocksdb::WriteOptions(), handle, key, tx, value);
+                    break;
+                case DELETE: // TODO: Does this really happen?
+                    storage.db->Merge(rocksdb::WriteOptions(), handle, key, tx, value);
+                    break;
+            }
+        } while (true);
+    }
+
     ptr<WriteTransaction> Tx(uint64_t txId) {
         if (openTxns.find(txId) != openTxns.end()) {
             return openTxns.find(txId)->second;
@@ -213,7 +392,6 @@ private:
     }
 
     ptr<Graph> graph;
-    rocksdb::DB *db;
     std::map<uint64_t, ptr<WriteTransaction> > openTxns;
 };
 
@@ -234,7 +412,7 @@ public:
         params.return_method_ = raft_params::blocking;
         params.auto_forwarding_ = true;
 
-        my_state_machine_ = cs_new<StateMachine>(graph, graph->GetDB());
+        my_state_machine_ = cs_new<StateMachine>(graph);
         launcher_ = cs_new<raft_launcher>();
         server_ = launcher_->init(my_state_machine_, my_state_manager, my_logger, raftPort,
                                   asio_opt, params);

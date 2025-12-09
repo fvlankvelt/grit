@@ -327,6 +327,8 @@ public:
 
     uint64_t GetTxId() const { return txn->GetTxId(); }
 
+    uint64_t GetFluidTxId() const { return txn->GetFluidTxId(); }
+
     VertexIterator *GetVerticesByType(const std::string &type) {
         return new VertexIterator(
             storage.db->NewIterator(fluidReadOptions, storage.vertices),
@@ -557,6 +559,7 @@ public:
     }
 
     ~Graph() {
+        storage.db->DestroyColumnFamilyHandle(storage.labels);
         storage.db->DestroyColumnFamilyHandle(storage.edges);
         storage.db->DestroyColumnFamilyHandle(storage.vertices);
         storage.db->DestroyColumnFamilyHandle(storage.index);
@@ -570,11 +573,11 @@ public:
 
     WriteTransaction *OpenForWrite() { return new WriteTransaction(storage, txMgr); }
 
-    friend class Service;
+    friend class StateMachine;
 
 private:
-    rocksdb::DB *GetDB() const {
-        return storage.db;
+    const Storage& GetStorage() const {
+        return storage;
     }
 
     std::shared_ptr<TransactionManager> txMgr;

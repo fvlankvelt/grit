@@ -13,24 +13,14 @@
 
 enum TransactionException { TX_IS_READONLY, TX_CONFLICT, TX_INVALIDATED, TX_NOT_IN_PROGRESS };
 
-class TransactionContext {
-public:
-    TransactionContext() = default;
-
-    virtual ~TransactionContext() = default;
-
-    virtual bool IsInvalid(uint64_t txId) const = 0;
-};
-
 class Transaction {
 public:
     Transaction(
-        const TransactionContext &ctx,
         const uint64_t txId,
         const uint64_t liveStart,
         const std::map<uint64_t, uint64_t>& inProgressWithStart,
         bool readOnly
-    ) : ctx(ctx), txId(txId), readOnly(readOnly), liveStart(liveStart) {
+    ) : txId(txId), readOnly(readOnly), liveStart(liveStart) {
         for (auto &it: inProgressWithStart) {
             inProgress.insert(it.first);
             if (it.second < this->liveStart) {
@@ -51,14 +41,12 @@ public:
     uint64_t GetLogWindowStart() const { return liveStart; }
 
     bool IsExcluded(uint64_t otherTxId) const {
-        return otherTxId > txId || inProgress.find(otherTxId) != inProgress.end() || ctx.IsInvalid(otherTxId);
+        return otherTxId > txId || inProgress.find(otherTxId) != inProgress.end();
     }
 
     friend class TransactionManager;
 
 private:
-    const TransactionContext &ctx;
-
     // last transaction that can be read
     uint64_t txId;
 
@@ -71,7 +59,7 @@ private:
     std::set<VertexId> touched;
 };
 
-class TransactionManager : public TransactionContext {
+class TransactionManager {
 public:
     TransactionManager() : db_(nullptr) {
     }
@@ -138,11 +126,11 @@ public:
             for (const auto &inProgres: inProgress) {
                 progress.insert(std::pair(inProgres.first, inProgres.second->GetLogWindowStart()));
             }
-            return std::make_shared<Transaction>(*this, lastWriteTxId, lastRaftLogIdx, progress, true);
+            return std::make_shared<Transaction>(lastWriteTxId, lastRaftLogIdx, progress, true);
         } else {
             ulong raft_log_idx;
             std::map<uint64_t, uint64_t> progress = GetInProgress(txId, raft_log_idx);
-            return std::make_shared<Transaction>(*this, txId, raft_log_idx, progress, true);
+            return std::make_shared<Transaction>(txId, raft_log_idx, progress, true);
         }
     }
 
@@ -154,7 +142,7 @@ public:
             mapping.insert(std::pair(inProgres.first, inProgres.second->GetLogWindowStart()));
         }
         // want to be able to read anything that's been written
-        std::shared_ptr<Transaction> tx = std::make_shared<Transaction>(*this, lastWriteTxId, lastRaftLogIdx, mapping, false);
+        std::shared_ptr<Transaction> tx = std::make_shared<Transaction>(lastWriteTxId, lastRaftLogIdx, mapping, false);
         AddInProgress(tx, raft_log_idx);
         WriteState(raft_log_idx);
         return tx;
@@ -170,7 +158,7 @@ public:
         }
     }
 
-    bool IsInvalid(uint64_t txId) const override {
+    bool IsInvalid(uint64_t txId) const {
         std::shared_lock lock(invalid_mutex);
         return invalid.find(txId) != invalid.end();
     }
@@ -353,7 +341,6 @@ private:
         storage::Transaction state;
         state.ParseFromString(value);
         std::shared_ptr<Transaction> txn = std::make_shared<Transaction>(
-            *this,
             txId,
             raft_log_idx,
             mapping,

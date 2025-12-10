@@ -24,6 +24,63 @@ const std::string ToHex(const rocksdb::Slice &slice) {
     return ss.str();
 }
 
+inline thread_local std::shared_ptr<Transaction> mergeThreadContext;
+
+class MergeGuard {
+public:
+    MergeGuard(const std::shared_ptr<Transaction> &txn) : txn(txn) {
+        mergeThreadContext = txn;
+    }
+
+    ~MergeGuard() {
+        mergeThreadContext = nullptr;
+    }
+
+private:
+    std::shared_ptr<Transaction> txn;
+};
+
+/**
+ * Merge updates to a key, filtering out those created by invalid transactions.
+ * Should only be used on time ranges that exclude the "active window" as in-progress
+ * transactions are still undecided.
+ */
+class TxMergeOperator : public rocksdb::MergeOperator {
+public:
+    TxMergeOperator(const shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
+    }
+
+    const char *Name() const override { return "TxMergeOperator"; }
+
+    bool FullMergeV2(
+        const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
+        MergeValue value;
+        if (merge_in.existing_value) {
+            merge_out->new_value = merge_in.existing_value->ToString(false);
+        } else {
+            value.action = DELETE;
+            value.txId = 0;
+            merge_out->new_value = encoding().put_merge(value).ToString();
+        }
+
+        auto operands = merge_in.operand_list;
+        for (auto &operand: std::ranges::reverse_view(operands)) {
+            encoding(operand).get_merge(value);
+            if (mergeThreadContext != nullptr && mergeThreadContext->IsExcluded(value.txId)) {
+                continue;
+            }
+            if (!txMgr->IsInvalid(value.txId)) {
+                merge_out->new_value = operand.ToString();
+                break;
+            }
+        }
+        return true;
+    }
+
+private:
+    std::shared_ptr<TransactionManager> txMgr;
+};
+
 class TxCompactionFilter : public rocksdb::CompactionFilter {
 public:
     TxCompactionFilter(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
@@ -70,6 +127,11 @@ public:
         const std::shared_ptr<Transaction> &txn)
         : txn(txn), prefixStr(prefix.data(), prefix.size()), prefixSlice(prefixStr), fluid(fluid), frozen(frozen) {
         comparator = rocksdb::BytewiseComparatorWithU64Ts();
+        {
+            MergeGuard guard(txn);
+            fluid->Seek(prefix);
+            frozen->Seek(prefix);
+        }
     }
 
     virtual ~EntryIterator() = default;
@@ -82,6 +144,8 @@ public:
      * Proceed to next key.  Skip older updates to a key and updates from excluded transactions.
      */
     void Next() {
+        MergeGuard guard(txn);
+
         bool foundKey = false;
         while (!foundKey) {
             bool fluidValid = fluid->Valid() && IsValidKey(fluid->key());
@@ -99,24 +163,28 @@ public:
                 cmp = +1;
             }
 
-            uint64_t keyTxId;
+            // uint64_t keyTxId;
             MergeValue value;
             if (cmp > 0) {
                 encoding(frozen->value()).get_merge(value);
-                keyTxId = value.txId;
+                // keyTxId = value.txId;
+                /*
                 if (txn->IsExcluded(keyTxId)) {
                     frozen->Next();
                     continue;
                 }
+                */
                 currentKey = frozen->key().ToString();
                 assert(frozen->key().ToString().compare(currentKey) == 0);
             } else {
                 encoding(fluid->value()).get_merge(value);
-                keyTxId = value.txId;
+                // keyTxId = value.txId;
+                /*
                 if (txn->IsExcluded(keyTxId)) {
                     fluid->Next();
                     continue;
                 }
+                */
                 // time-range iterator includes user-defined timestamp in key
                 // strip it to filter out subsequent entries with the same key
                 currentKey = FluidKey();
@@ -176,8 +244,6 @@ public:
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
-        fluid->Seek(prefix);
-        frozen->Seek(prefix);
         Next();
     }
 
@@ -201,8 +267,6 @@ public:
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
-        fluid->Seek(prefix);
-        frozen->Seek(prefix);
         Next();
     }
 
@@ -229,8 +293,6 @@ public:
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
-        fluid->Seek(prefix);
-        frozen->Seek(prefix);
         Next();
     }
 
@@ -250,8 +312,6 @@ public:
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : EntryIterator(fluid, frozen, prefix, txn) {
-        fluid->Seek(prefix);
-        frozen->Seek(prefix);
         Next();
     }
 
@@ -466,15 +526,15 @@ private:
 
     void Put(rocksdb::ColumnFamilyHandle *handle, ulong raft_log_idx, const rocksdb::Slice &key) const {
         std::string logStr;
-        rocksdb::Status status = storage.db->Put(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
-                                                 putEnc.ToSlice());
+        rocksdb::Status status = storage.db->Merge(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
+                                                   putEnc.ToSlice());
         assert(status.ok());
     }
 
     void Delete(rocksdb::ColumnFamilyHandle *handle, ulong raft_log_idx, const rocksdb::Slice &key) const {
         std::string logStr;
-        rocksdb::Status status = storage.db->Put(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
-                                                 delEnc.ToSlice());
+        rocksdb::Status status = storage.db->Merge(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
+                                                   delEnc.ToSlice());
         assert(status.ok());
     }
 
@@ -492,6 +552,7 @@ public:
         options.create_missing_column_families = true;
 
         rocksdb::ColumnFamilyOptions cfOptions(options);
+        cfOptions.merge_operator.reset(new TxMergeOperator(txMgr));
         cfOptions.comparator = rocksdb::BytewiseComparatorWithU64Ts();
         compactionFilter.reset(new TxCompactionFilter(txMgr));
         cfOptions.compaction_filter = compactionFilter.get();

@@ -10,26 +10,27 @@ int main() {
     std::filesystem::remove_all("/tmp/graphdb");
     Graph graph("/tmp/graphdb");
 
+    ulong log_idx = 0;
     auto started = chrono::duration_cast<chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
     std::cout << "Creating vertices and edges" << std::endl;
     int num_created = 0;
     for (int i = 0; i < N_TXNS; i++) {
-        auto txn = graph.OpenForWrite();
-        for (int j = 0; j < N_VERTICES_PER_TXN; j++) {
-            int id = 100 * j + i;
+        auto txn = graph.OpenForWrite(log_idx++);
+        for (ulong j = 0; j < N_VERTICES_PER_TXN; j++) {
+            ulong id = 100 * j + i;
             std::stringstream ss;
             ss << "label-" << j;
             VertexId vertex_id = {"comp", id};
-            txn->AddVertex(vertex_id);
-            txn->AddLabel(vertex_id, ss.str());
-            txn->AddLabel(vertex_id, "common");
+            txn->AddVertex(vertex_id, log_idx++);
+            txn->AddLabel(vertex_id, ss.str(), log_idx++);
+            txn->AddLabel(vertex_id, "common", log_idx++);
             if (i > 0) {
                 VertexId other_id = {"comp", 100 * (i - 1) + j};
-                txn->AddEdge("sibling", vertex_id, other_id);
+                txn->AddEdge("sibling", vertex_id, other_id, log_idx++);
             }
             num_created++;
         }
-        txn->Commit();
+        txn->Commit(log_idx++);
     }
     auto vertices_created = chrono::duration_cast<chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
     auto duration = vertices_created - started;

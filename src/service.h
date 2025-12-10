@@ -61,10 +61,9 @@ public:
         std::cout << "committing status " << log_idx << std::endl;
 
         {
-            unique_ptr<ReadTransaction> txn(graph->OpenForRead());
             rocksdb::WriteOptions writeOptions;
             std::string txStr;
-            rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(txn->GetTxId(), &txStr));
+            rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(log_idx, &txStr));
             auto status = graph->GetStorage().db->Put(writeOptions, "state_machine", txSlice, std::to_string(log_idx));
             assert(status.ok());
         }
@@ -74,34 +73,30 @@ public:
         ReadBuffer(entry, data);
         if (entry.has_open()) {
             const api::OpenRequest &request = entry.open();
-            ptr<ReadTransaction> txn = OpenTransaction(request);
+            ptr<WriteTransaction> txn = OpenWriteTransaction(request, log_idx);
             api::Transaction response;
-            if (txn->IsReadOnly()) {
-                response.set_type(api::READ);
-            } else {
                 response.set_type(api::WRITE);
-            }
             response.set_txid(txn->GetTxId());
             return WriteBuffer(response);
         }
         api::TransactionResponse response;
         try {
             if (entry.has_commit()) {
-                Commit(entry.commit());
+                Commit(entry.commit(), log_idx);
             } else if (entry.has_rollback()) {
-                Rollback(entry.rollback());
+                Rollback(entry.rollback(), log_idx);
             } else if (entry.has_addvertex()) {
-                AddVertex(entry.addvertex());
+                AddVertex(entry.addvertex(), log_idx);
             } else if (entry.has_removevertex()) {
-                RemoveVertex(entry.removevertex());
+                RemoveVertex(entry.removevertex(), log_idx);
             } else if (entry.has_addlabel()) {
-                AddLabel(entry.addlabel());
+                AddLabel(entry.addlabel(), log_idx);
             } else if (entry.has_removelabel()) {
-                RemoveLabel(entry.removelabel());
+                RemoveLabel(entry.removelabel(), log_idx);
             } else if (entry.has_addedge()) {
-                AddEdge(entry.addedge());
+                AddEdge(entry.addedge(), log_idx);
             } else if (entry.has_removeedge()) {
-                RemoveEdge(entry.removeedge());
+                RemoveEdge(entry.removeedge(), log_idx);
             }
             response.set_status(api::OK);
         } catch (TransactionException te) {
@@ -123,62 +118,61 @@ public:
         return WriteBuffer(response);
     }
 
-    ptr<ReadTransaction> OpenTransaction(const api::OpenRequest &request) {
-        if (request.type() == api::READ) {
-            return ptr<ReadTransaction>(graph->OpenForRead(request.txid()));
-        } else {
-            ptr<WriteTransaction> txn(graph->OpenForWrite());
-            openTxns.insert(std::pair(txn->GetTxId(), txn));
-            return txn;
-        }
+    ptr<ReadTransaction> OpenReadTransaction(const api::OpenRequest &request) {
+        return ptr<ReadTransaction>(graph->OpenForRead(request.txid()));
     }
 
-    void Commit(const api::Transaction &request) {
+    ptr<WriteTransaction> OpenWriteTransaction(const api::OpenRequest &request, ulong raft_log_idx) {
+        ptr<WriteTransaction> txn(graph->OpenForWrite(raft_log_idx));
+        return txn;
+    }
+
+    void Commit(const api::Transaction &request, ulong raft_log_idx) {
         uint64_t txId = request.txid();
-        Tx(txId)->Commit();
-        openTxns.erase(txId);
+        Tx(txId)->Commit(raft_log_idx);
     }
 
-    void Rollback(const api::Transaction &request) {
+    void Rollback(const api::Transaction &request, ulong raft_log_idx) {
         uint64_t txId = request.txid();
-        Tx(txId)->Rollback();
-        openTxns.erase(txId);
+        Tx(txId)->Rollback(raft_log_idx);
     }
 
-    void AddVertex(const api::AddVertexRequest &request) {
+    void AddVertex(const api::AddVertexRequest &request, ulong raft_log_idx) {
         Tx(request.txid())->AddVertex(
-            {request.vertexid().type(), request.vertexid().id()});
+            {request.vertexid().type(), request.vertexid().id()}, raft_log_idx);
     }
 
-    void RemoveVertex(const api::RemoveVertexRequest &request) {
+    void RemoveVertex(const api::RemoveVertexRequest &request, ulong raft_log_idx) {
         Tx(request.txid())->RemoveVertex(
-            {request.vertexid().type(), request.vertexid().id()});
+            {request.vertexid().type(), request.vertexid().id()}, raft_log_idx);
     }
 
-    void AddLabel(const api::AddLabelRequest &request) {
-        Tx(request.txid())->AddLabel({
-                                         request.vertexid().type(), request.vertexid().id()
-                                     }, request.label());
+    void AddLabel(const api::AddLabelRequest &request, ulong raft_log_idx) {
+        Tx(request.txid())->AddLabel(
+            {request.vertexid().type(), request.vertexid().id()}, request.label(), raft_log_idx);
     }
 
-    void RemoveLabel(const api::RemoveLabelRequest &request) {
-        Tx(request.txid())->RemoveLabel({
-                                            request.vertexid().type(), request.vertexid().id()
-                                        }, request.label());
+    void RemoveLabel(const api::RemoveLabelRequest &request, ulong raft_log_idx) {
+        Tx(request.txid())->RemoveLabel(
+            {request.vertexid().type(), request.vertexid().id()}, request.label(), raft_log_idx);
     }
 
-    void AddEdge(const api::AddEdgeRequest &request) {
+    void AddEdge(const api::AddEdgeRequest &request, ulong raft_log_idx) {
         Tx(request.txid())->AddEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
-            {request.tovertexid().type(), request.tovertexid().id()});
+            {request.tovertexid().type(), request.tovertexid().id()},
+            raft_log_idx
+        );
     }
 
-    void RemoveEdge(const api::RemoveEdgeRequest &request) {
+    void RemoveEdge(const api::RemoveEdgeRequest &request, ulong raft_log_idx) {
         Tx(request.txid())->RemoveEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
-            {request.tovertexid().type(), request.tovertexid().id()});
+            {request.tovertexid().type(), request.tovertexid().id()},
+            raft_log_idx
+        );
     }
 
     bool apply_snapshot(snapshot &s) {
@@ -215,10 +209,7 @@ public:
             return 0;
         }
         if (user_snp_ctx == nullptr) {
-            data_out = buffer::expand(*data_out, 8);
-            rocksdb::ReadOptions readOptions;
-            unique_ptr<ReadTransaction> txn(graph->OpenForRead());
-            user_snp_ctx = new SnapshotContext(graph, obj_id, txn->GetTxId());
+            user_snp_ctx = new SnapshotContext(graph, obj_id, last_commit_index());
         }
         SnapshotContext *ctx = static_cast<SnapshotContext *>(user_snp_ctx);
         if (ctx->Read(data_out)) {
@@ -229,12 +220,14 @@ public:
 
     void save_logical_snp_obj(snapshot &s, ulong &obj_id, buffer &data, bool is_first_obj, bool is_last_obj) override {
         if (obj_id == 0) {
-            std::unique_ptr<ReadTransaction> txn(graph->OpenForRead());
-            obj_id = txn->GetFluidTxId();
+            obj_id = last_commit_index();
             return;
         }
         WriteSnapshotBuffer(data);
         obj_id++;
+        if (is_last_obj) {
+            graph->txMgr->Initialize(graph->GetStorage().db);
+        }
     }
 
     void free_user_snp_ctx(void *&user_snp_ctx) override {
@@ -384,15 +377,10 @@ private:
     }
 
     ptr<WriteTransaction> Tx(uint64_t txId) {
-        if (openTxns.find(txId) != openTxns.end()) {
-            return openTxns.find(txId)->second;
-        } else {
-            throw TX_NOT_IN_PROGRESS;
-        }
+        return cs_new<WriteTransaction>(graph->GetStorage(), graph->txMgr, graph->txMgr->GetWriteTxn(txId));
     }
 
     ptr<Graph> graph;
-    std::map<uint64_t, ptr<WriteTransaction> > openTxns;
 };
 
 class Service : public api::GritApi::Service {
@@ -402,8 +390,8 @@ public:
         ptr<state_mgr> my_state_manager = cs_new<inmem_state_mgr>(id, "localhost:" +
                                                                       std::to_string(raftPort));
         auto cluster_config = my_state_manager->load_config();
-        for (auto peer = peers.begin(); peer != peers.end(); ++peer) {
-            ptr<srv_config> peer_conf = cs_new<srv_config>(peer->id, peer->address);
+        for (auto & peer : peers) {
+            ptr<srv_config> peer_conf = cs_new<srv_config>(peer.id, peer.address);
             cluster_config->get_servers().push_back(peer_conf);
         }
         asio_service::options asio_opt;
@@ -430,10 +418,16 @@ public:
         grpc::ServerContext *context,
         const api::OpenRequest *request,
         api::Transaction *response) override {
+        if (request->type() == api::READ) {
+            ptr txn(my_state_machine_->OpenReadTransaction(*request));
+            response->set_type(api::READ);
+            response->set_txid(txn->GetTxId());
+            return grpc::Status::OK;
+        }
+
         api::RaftLogEntry entry;
         entry.mutable_open()->CopyFrom(*request);
         ptr<buffer> log_entry = WriteBuffer(entry);
-
         auto cmd_result = server_->append_entries({log_entry});
         if (cmd_result->get_result_code() == OK) {
             if (cmd_result->has_result()) {
@@ -605,8 +599,7 @@ private:
     template<class D, class A>
     static grpc::Status WriteItems(
         grpc::ServerWriter<A> *writer,
-        EntryIterator<D> *iter, std::function<void(const D &, A &)> convert) {
-        std::unique_ptr<EntryIterator<D> > items(iter);
+        std::shared_ptr<EntryIterator<D>> items, std::function<void(const D &, A &)> convert) {
         grpc::WriteOptions wo;
         D item;
         bool first = true;

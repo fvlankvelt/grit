@@ -3,9 +3,15 @@ edition = "2023";
 
 package storage;
 
-// In-progress transactions are put & deleted with the "last write tx open" pointer as user-defined timestamp.
+// In-progress snapshots are persisted for snapshot isolation and time-travel
+// Each InProgress corresponds to a txId
 message InProgress {
-    uint64 txId = 1;
+    uint64 logIdx = 1;
+    message WriteTx {
+        uint64 txId = 1;
+        uint64 logIdx = 2;
+    }
+    repeated WriteTx txns = 2;
 }
 
 // Committed transactions are written so that conficts can be detected with to-be-committed transactions.

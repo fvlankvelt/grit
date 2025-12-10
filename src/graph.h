@@ -119,18 +119,14 @@ template<class T>
 class EntryIterator {
 public:
     EntryIterator(
-        rocksdb::Iterator *fluid, // time-range iterator that includes in-progress txn data
-        // (multiple updates per key)
-        rocksdb::Iterator *frozen, // time-travel iterator that only contains historic data
-        // (one entry per key)
+        rocksdb::Iterator *upstream,
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : txn(txn), prefixStr(prefix.data(), prefix.size()), prefixSlice(prefixStr), fluid(fluid), frozen(frozen) {
+        : txn(txn), prefixStr(prefix.data(), prefix.size()), prefixSlice(prefixStr), upstream(upstream) {
         comparator = rocksdb::BytewiseComparatorWithU64Ts();
         {
             MergeGuard guard(txn);
-            fluid->Seek(prefix);
-            frozen->Seek(prefix);
+            upstream->Seek(prefix);
         }
     }
 
@@ -147,48 +143,11 @@ public:
         MergeGuard guard(txn);
 
         bool foundKey = false;
-        while (!foundKey) {
-            bool fluidValid = fluid->Valid() && IsValidKey(fluid->key());
-            bool frozenValid = frozen->Valid() && IsValidKey(frozen->key());
-            int cmp;
-            if (!fluidValid && !frozenValid) {
-                break;
-            }
-            if (fluidValid && frozenValid) {
-                cmp = comparator->CompareWithoutTimestamp(
-                    fluid->key(), true, frozen->key(), false);
-            } else if (fluidValid) {
-                cmp = -1;
-            } else {
-                cmp = +1;
-            }
-
-            // uint64_t keyTxId;
+        while (!foundKey && upstream->Valid() && IsValidKey(upstream->key())) {
             MergeValue value;
-            if (cmp > 0) {
-                encoding(frozen->value()).get_merge(value);
-                // keyTxId = value.txId;
-                /*
-                if (txn->IsExcluded(keyTxId)) {
-                    frozen->Next();
-                    continue;
-                }
-                */
-                currentKey = frozen->key().ToString();
-                assert(frozen->key().ToString().compare(currentKey) == 0);
-            } else {
-                encoding(fluid->value()).get_merge(value);
-                // keyTxId = value.txId;
-                /*
-                if (txn->IsExcluded(keyTxId)) {
-                    fluid->Next();
-                    continue;
-                }
-                */
-                // time-range iterator includes user-defined timestamp in key
-                // strip it to filter out subsequent entries with the same key
-                currentKey = FluidKey();
-            }
+            encoding(upstream->value()).get_merge(value);
+            currentKey = upstream->key().ToString();
+            assert(upstream->key().ToString().compare(currentKey) == 0);
 
             // don't report deleted keys
             if (value.action == PUT) {
@@ -197,11 +156,8 @@ public:
             }
 
             // skip all remaining entries for the same key
-            while (fluid->Valid() && FluidKey().compare(currentKey) == 0) {
-                fluid->Next();
-            }
-            while (frozen->Valid() && frozen->key().ToString().compare(currentKey) == 0) {
-                frozen->Next();
+            while (upstream->Valid() && upstream->key().ToString().compare(currentKey) == 0) {
+                upstream->Next();
             }
         }
 
@@ -223,27 +179,21 @@ private:
         return key.starts_with(prefixSlice);
     }
 
-    std::string FluidKey() const {
-        return {fluid->key().data(), fluid->key().size() - 8};
-    }
-
     std::string currentKey;
     const std::shared_ptr<Transaction> txn;
     const rocksdb::Comparator *comparator;
     std::string prefixStr;
     rocksdb::Slice prefixSlice;
-    std::unique_ptr<rocksdb::Iterator> fluid;
-    std::unique_ptr<rocksdb::Iterator> frozen;
+    std::unique_ptr<rocksdb::Iterator> upstream;
 };
 
 class VertexIterator : public EntryIterator<VertexId> {
 public:
     VertexIterator(
-        rocksdb::Iterator *fluid,
-        rocksdb::Iterator *frozen,
+        rocksdb::Iterator *upstream,
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : EntryIterator(fluid, frozen, prefix, txn) {
+        : EntryIterator(upstream, prefix, txn) {
         Next();
     }
 
@@ -262,11 +212,10 @@ protected:
 class IndexVertexIterator : public EntryIterator<VertexId> {
 public:
     IndexVertexIterator(
-        rocksdb::Iterator *fluid,
-        rocksdb::Iterator *frozen,
+        rocksdb::Iterator *upstream,
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : EntryIterator(fluid, frozen, prefix, txn) {
+        : EntryIterator(upstream, prefix, txn) {
         Next();
     }
 
@@ -288,11 +237,10 @@ protected:
 class LabelIterator : public EntryIterator<std::string> {
 public:
     LabelIterator(
-        rocksdb::Iterator *fluid,
-        rocksdb::Iterator *frozen,
+        rocksdb::Iterator *upstream,
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : EntryIterator(fluid, frozen, prefix, txn) {
+        : EntryIterator(upstream, prefix, txn) {
         Next();
     }
 
@@ -307,11 +255,10 @@ protected:
 class EdgeIterator : public EntryIterator<Edge> {
 public:
     EdgeIterator(
-        rocksdb::Iterator *fluid,
-        rocksdb::Iterator *frozen,
+        rocksdb::Iterator *upstream,
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
-        : EntryIterator(fluid, frozen, prefix, txn) {
+        : EntryIterator(upstream, prefix, txn) {
         Next();
     }
 
@@ -334,11 +281,7 @@ public:
         : storage(storage), txn(txn) {
         // TODO: Optimize this - only need to read until last entry that could have been written by txn
         log_window_end = rocksdb::EncodeU64Ts(-1, &log_end_str);
-        log_window_start = rocksdb::EncodeU64Ts(txn->GetLogWindowStart(), &log_start_str);
-        fluidReadOptions.timestamp = &log_window_end;
-        fluidReadOptions.iter_start_ts = &log_window_start;
-        fluidReadOptions.total_order_seek = true;
-        frozenReadOptions.timestamp = &log_window_start;
+        frozenReadOptions.timestamp = &log_window_end;
         frozenReadOptions.total_order_seek = true;
     }
 
@@ -350,7 +293,6 @@ public:
 
     std::shared_ptr<VertexIterator> GetVerticesByType(const std::string &type) const {
         return std::make_shared<VertexIterator>(
-            storage.db->NewIterator(fluidReadOptions, storage.vertices),
             storage.db->NewIterator(frozenReadOptions, storage.vertices),
             encoding().put_string(type).ToSlice(),
             txn);
@@ -358,7 +300,6 @@ public:
 
     std::shared_ptr<IndexVertexIterator> GetVerticesByLabel(const std::string &label, const std::string &type) const {
         return std::make_shared<IndexVertexIterator>(
-            storage.db->NewIterator(fluidReadOptions, storage.index),
             storage.db->NewIterator(frozenReadOptions, storage.index),
             encoding().put_string(label).put_string(type).ToSlice(),
             txn);
@@ -366,7 +307,6 @@ public:
 
     std::shared_ptr<LabelIterator> GetLabels(const VertexId &vertexId) const {
         return std::make_shared<LabelIterator>(
-            storage.db->NewIterator(fluidReadOptions, storage.labels),
             storage.db->NewIterator(frozenReadOptions, storage.labels),
             encoding().put_vertex(vertexId).ToSlice(),
             txn);
@@ -374,14 +314,7 @@ public:
 
     std::shared_ptr<EdgeIterator> GetEdges(
         const VertexId &vertexId, const std::string &label, const Direction direction) const {
-        int size = 10;
-        std::vector<rocksdb::PinnableSlice> values(size);
-        int n_operands;
-        rocksdb::GetMergeOperandsOptions options;
-        options.continue_cb = [](const rocksdb::Slice &slice) -> bool { return true; };
-        storage.db->GetMergeOperands(fluidReadOptions, storage.edges, "", values.data(), &options, &n_operands);
         return std::make_shared<EdgeIterator>(
-            storage.db->NewIterator(fluidReadOptions, storage.edges),
             storage.db->NewIterator(frozenReadOptions, storage.edges),
             encoding().put_vertex(vertexId).put_string(label).put_direction(direction).ToSlice(),
             txn);
@@ -389,14 +322,12 @@ public:
 
     std::shared_ptr<EdgeIterator> GetEdges(const VertexId &vertexId) const {
         return std::make_shared<EdgeIterator>(
-            storage.db->NewIterator(fluidReadOptions, storage.edges),
             storage.db->NewIterator(frozenReadOptions, storage.edges),
             encoding().put_vertex(vertexId).ToSlice(),
             txn);
     }
 
 protected:
-    rocksdb::ReadOptions fluidReadOptions;
     rocksdb::ReadOptions frozenReadOptions;
 
     std::string log_start_str;

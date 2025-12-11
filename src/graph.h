@@ -113,6 +113,7 @@ struct Storage {
     rocksdb::ColumnFamilyHandle *vertices;
     rocksdb::ColumnFamilyHandle *edges;
     rocksdb::ColumnFamilyHandle *labels;
+    rocksdb::ColumnFamilyHandle *raft_log;
 };
 
 template<class T>
@@ -494,6 +495,7 @@ public:
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("vertices", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("edges", cfOptions));
         descriptors.push_back(rocksdb::ColumnFamilyDescriptor("labels", cfOptions));
+        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("raft_log", cfOptions));
 
         std::vector<rocksdb::ColumnFamilyHandle *> handles;
         rocksdb::Status status =
@@ -505,11 +507,13 @@ public:
         storage.vertices = handles[2];
         storage.edges = handles[3];
         storage.labels = handles[4];
+        storage.raft_log = handles[5];
 
         txMgr->Initialize(storage.db);
     }
 
     ~Graph() {
+        storage.db->DestroyColumnFamilyHandle(storage.raft_log);
         storage.db->DestroyColumnFamilyHandle(storage.labels);
         storage.db->DestroyColumnFamilyHandle(storage.edges);
         storage.db->DestroyColumnFamilyHandle(storage.vertices);

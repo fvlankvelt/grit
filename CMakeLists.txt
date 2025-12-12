@@ -17,6 +17,9 @@ set(API_DEF ${CMAKE_SOURCE_DIR}/api/api.proto)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# Ensure the generated directory exists
+file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/generated)
+
 # Command to generate C++ files from the proto file
 add_custom_command(
     OUTPUT ${CMAKE_SOURCE_DIR}/generated/storage.pb.cc ${CMAKE_SOURCE_DIR}/generated/storage.pb.h

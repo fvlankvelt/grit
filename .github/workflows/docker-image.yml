@@ -7,12 +7,16 @@ on:
     branches: [ "main" ]
 
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build the Docker image
-      run: docker build . --file docker/Dockerfile --tag grit:${{ github.sha }}
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        push: true
+        file: ./docker/Dockerfile
+        tags: grit:${{ github.sha }}

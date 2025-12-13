@@ -6,12 +6,9 @@ package storage;
 // In-progress snapshots are persisted for snapshot isolation and time-travel
 // Each InProgress corresponds to a txId
 message InProgress {
+    // last readable data at this txId
     uint64 logIdx = 1;
-    message WriteTx {
-        uint64 txId = 1;
-        uint64 logIdx = 2;
-    }
-    repeated WriteTx txns = 2;
+    repeated uint64 txIds = 2;
 }
 
 // Committed transactions are written so that conficts can be detected with to-be-committed transactions.

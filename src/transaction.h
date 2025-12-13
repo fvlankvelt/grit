@@ -17,16 +17,10 @@ class Transaction {
 public:
     Transaction(
         const uint64_t txId,
-        const uint64_t liveStart,
-        const std::map<uint64_t, uint64_t>& inProgressWithStart,
+        const uint64_t lastLogIdx,
+        const std::set<uint64_t> &inProgress,
         bool readOnly
-    ) : txId(txId), readOnly(readOnly), liveStart(liveStart) {
-        for (auto &it: inProgressWithStart) {
-            inProgress.insert(it.first);
-            if (it.second < this->liveStart) {
-                this->liveStart = it.second;
-            }
-        }
+    ) : txId(txId), lastLogIdx(lastLogIdx), readOnly(readOnly), inProgress(inProgress) {
     }
 
     void Touch(const VertexId &key) {
@@ -38,7 +32,7 @@ public:
 
     uint64_t GetTxId() const { return txId; }
 
-    uint64_t GetLogWindowStart() const { return liveStart; }
+    uint64_t GetLastLogIdx() const { return lastLogIdx; }
 
     bool IsExcluded(uint64_t otherTxId) const {
         return otherTxId > txId || inProgress.find(otherTxId) != inProgress.end();
@@ -50,9 +44,8 @@ private:
     // last transaction that can be read
     uint64_t txId;
 
-    // start of in-progress transaction window, there are no in-progress txns before it.
-    // All transactions that started after it have a start logIdx bigger than this.
-    uint64_t liveStart;
+    // last logIdx that can be read
+    uint64_t lastLogIdx;
 
     bool readOnly;
     std::set<uint64_t> inProgress;
@@ -75,14 +68,14 @@ public:
         std::string strState;
         auto status = db->Get(options, "tx_mgr:state", &strState);
         if (status.IsNotFound()) {
-            SaveInProgress(0);
+            SaveCurrentInProgress();
             return;
         }
         assert(status.ok());
 
         storage::TransactionManagerState state;
         state.ParseFromString(strState);
-        lastWriteTxId = state.lasttxid();
+        readTxId = state.lasttxid();
         invalid.clear();
         auto inv = state.invalid();
         for (unsigned long &it: inv) {
@@ -110,26 +103,24 @@ public:
         }
 
         ulong last_log_idx;
-        auto txWithStarts = GetInProgress(lastWriteTxId, last_log_idx);
+        auto txWithStarts = GetInProgress(readTxId, last_log_idx);
         inProgress.clear();
-        for (auto &txWithStart: txWithStarts) {
-            uint64_t txId = txWithStart.first;
+        for (auto &txId: txWithStarts) {
             inProgress.insert(std::pair(txId, LoadTransaction(txId)));
         }
     }
 
     std::shared_ptr<Transaction> OpenForRead(uint64_t txId = 0) const {
         std::shared_lock db_lock(db_mutex);
-        std::shared_lock lock(invalid_mutex);
         if (txId == 0) {
-            std::map<uint64_t, uint64_t> progress;
+            std::set<uint64_t> progress;
             for (const auto &inProgres: inProgress) {
-                progress.insert(std::pair(inProgres.first, inProgres.second->GetLogWindowStart()));
+                progress.insert(inProgres.first);
             }
-            return std::make_shared<Transaction>(lastWriteTxId, lastRaftLogIdx, progress, true);
+            return std::make_shared<Transaction>(readTxId, readLastLogIdx, progress, true);
         } else {
             ulong raft_log_idx;
-            std::map<uint64_t, uint64_t> progress = GetInProgress(txId, raft_log_idx);
+            std::set<uint64_t> progress = GetInProgress(txId, raft_log_idx);
             return std::make_shared<Transaction>(txId, raft_log_idx, progress, true);
         }
     }
@@ -137,13 +128,20 @@ public:
     std::shared_ptr<Transaction> OpenForWrite(ulong raft_log_idx) {
         std::unique_lock db_lock(db_mutex);
 
-        std::map<uint64_t, uint64_t> mapping;
+        std::set<uint64_t> mapping;
         for (const auto &inProgres: inProgress) {
-            mapping.insert(std::pair(inProgres.first, inProgres.second->GetLogWindowStart()));
+            mapping.insert(inProgres.first);
         }
-        // want to be able to read anything that's been written
-        std::shared_ptr<Transaction> tx = std::make_shared<Transaction>(lastWriteTxId, lastRaftLogIdx, mapping, false);
-        AddInProgress(tx, raft_log_idx);
+        readTxId++;
+        std::shared_ptr<Transaction> tx = std::make_shared<Transaction>(readTxId, -1, mapping, false);
+        // want to be able to read anything that's been written in this transaction
+        // this InProgress record will be overwritten when the transaction is committed
+        SaveInProgress(readTxId, -1, mapping);
+
+        inProgress.insert(std::pair(tx->GetTxId(), tx));
+        readTxId++;
+        SaveCurrentInProgress();
+
         WriteState(raft_log_idx);
         return tx;
     }
@@ -200,14 +198,21 @@ public:
 
             // hurray!  No conflicts detected
             recent.insert(std::pair(txId, txn.touched));
-            RemoveInProgress(txId, raft_log_idx);
+            readLastLogIdx = raft_log_idx;
+            // subsequent reads from this transaction are limited to what's been written
+            SaveInProgress(txId, readLastLogIdx, txn.inProgress);
+            inProgress.erase(txId);
+            readTxId++;
+            // next read transaction can read
+            SaveCurrentInProgress();
             WriteState(raft_log_idx);
         } catch (TransactionException te) {
             {
                 std::unique_lock lock(invalid_mutex);
                 invalid.insert(txId);
             }
-            RemoveInProgress(txId, raft_log_idx);
+            inProgress.erase(txId);
+            SaveCurrentInProgress();
             WriteState(raft_log_idx);
             throw;
         }
@@ -219,7 +224,8 @@ public:
             std::unique_lock lock(invalid_mutex);
             invalid.insert(txId);
         }
-        RemoveInProgress(txId, raft_log_idx);
+        inProgress.erase(txId);
+        SaveCurrentInProgress();
         WriteState(raft_log_idx);
     }
 
@@ -248,7 +254,7 @@ public:
     }
 
 private:
-    std::map<uint64_t, uint64_t> GetInProgress(uint64_t txId, ulong &raft_log_idx) const {
+    std::set<uint64_t> GetInProgress(uint64_t txId, ulong &raft_log_idx) const {
         std::string tsStr;
         rocksdb::Slice ts(rocksdb::EncodeU64Ts(-1, &tsStr));
 
@@ -267,26 +273,22 @@ private:
 
         raft_log_idx = inp.logidx();
 
-        std::map<uint64_t, uint64_t> result;
-        for (const auto &it: inp.txns()) {
-            result.insert(std::pair(it.txid(), it.logidx()));
+        std::set<uint64_t> result;
+        for (const auto &it: inp.txids()) {
+            result.insert(it);
         }
         return result;
     }
 
-    void AddInProgress(const std::shared_ptr<Transaction> &txn, ulong raft_log_idx) {
-        inProgress.insert(std::pair(txn->GetTxId(), txn));
-        SaveInProgress(raft_log_idx);
+    void SaveCurrentInProgress() const {
+        std::set<uint64_t> txIds;
+        for (auto &it: inProgress) {
+            txIds.insert(it.first);
+        }
+        SaveInProgress(readTxId, readLastLogIdx, txIds);
     }
 
-    void RemoveInProgress(uint64_t txId, ulong raft_log_idx) {
-        inProgress.erase(txId);
-        SaveInProgress(raft_log_idx);
-    }
-
-    void SaveInProgress(uint64_t raft_log_idx) {
-        lastRaftLogIdx = raft_log_idx;
-        ulong txId = ++lastWriteTxId;
+    void SaveInProgress(ulong txId, uint64_t raft_log_idx, const std::set<uint64_t>& inProgress) const {
         std::stringstream ss;
         ss << "tx_mgr:in_progress:" << txId;
 
@@ -295,10 +297,8 @@ private:
 
         storage::InProgress value;
         value.set_logidx(raft_log_idx);
-        for (auto &inProgres: inProgress) {
-            auto writeTx = value.add_txns();
-            writeTx->set_txid(inProgres.first);
-            writeTx->set_logidx(inProgres.second->GetLogWindowStart());
+        for (auto &txId: inProgress) {
+            value.add_txids(txId);
         }
         auto status = db_->Put(rocksdb::WriteOptions(), ss.str(), ts, value.SerializeAsString());
         assert(status.ok());
@@ -306,7 +306,7 @@ private:
 
     void WriteState(ulong raft_log_idx) const {
         storage::TransactionManagerState state;
-        state.set_lasttxid(lastWriteTxId);
+        state.set_lasttxid(readTxId);
         {
             std::shared_lock lock(invalid_mutex);
             for (unsigned long it: invalid) {
@@ -325,7 +325,7 @@ private:
 
     std::shared_ptr<Transaction> LoadTransaction(uint64_t txId) {
         ulong raft_log_idx;
-        std::map<uint64_t, uint64_t> mapping = GetInProgress(txId, raft_log_idx);
+        std::set<uint64_t> mapping = GetInProgress(txId, raft_log_idx);
 
         std::string tsStr;
         rocksdb::Slice ts(rocksdb::EncodeU64Ts(-1, &tsStr));
@@ -342,7 +342,7 @@ private:
         state.ParseFromString(value);
         std::shared_ptr<Transaction> txn = std::make_shared<Transaction>(
             txId,
-            raft_log_idx,
+            -1,
             mapping,
             false
         );
@@ -369,8 +369,8 @@ private:
 
     rocksdb::DB *db_;
 
-    uint64_t lastWriteTxId = 1;
-    uint64_t lastRaftLogIdx;
+    uint64_t readTxId = 1;
+    uint64_t readLastLogIdx;
     std::map<uint64_t, std::set<VertexId> > recent;
     std::map<uint64_t, std::shared_ptr<Transaction> > inProgress;
 

@@ -280,8 +280,7 @@ class ReadTransaction {
 public:
     ReadTransaction(const Storage &storage, const std::shared_ptr<Transaction> &txn)
         : storage(storage), txn(txn) {
-        // TODO: Optimize this - only need to read until last entry that could have been written by txn
-        log_window_end = rocksdb::EncodeU64Ts(-1, &log_end_str);
+        log_window_end = rocksdb::EncodeU64Ts(txn->GetLastLogIdx(), &log_end_str);
         frozenReadOptions.timestamp = &log_window_end;
         frozenReadOptions.total_order_seek = true;
     }

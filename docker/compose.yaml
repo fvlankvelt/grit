@@ -1,25 +1,31 @@
 services:
   grit-1:
-    image: grit
+    image: ghcr.io/fvlankvelt/grit:main
     ports:
       - "8081:8000"
       - "8002:8001"
     environment:
       RAFT_ID: "1"
+      GRPC_PORT: 8000
+      RAFT_PORT: 8001
       RAFT_PEERS: "1:grit-1:8001,2:grit-2:8001,3:grit-3:8001"
   grit-2:
-    image: grit
+    image: ghcr.io/fvlankvelt/grit:main
     ports:
       - "8082:8000"
       - "8003:8001"
     environment:
       RAFT_ID: "2"
+      GRPC_PORT: 8000
+      RAFT_PORT: 8001
       RAFT_PEERS: "1:grit-1:8001,2:grit-2:8001,3:grit-3:8001"
   grit-3:
-    image: grit
+    image: ghcr.io/fvlankvelt/grit:main
     ports:
       - "8083:8000"
       - "8004:8001"
     environment:
       RAFT_ID: "3"
+      GRPC_PORT: 8000
+      RAFT_PORT: 8001
       RAFT_PEERS: "1:grit-1:8001,2:grit-2:8001,3:grit-3:8001"

@@ -215,9 +215,6 @@ public:
         }
         WriteSnapshotBuffer(data);
         obj_id++;
-        if (is_last_obj) {
-            graph->txMgr->Initialize(graph->GetStorage().db);
-        }
     }
 
     void free_user_snp_ctx(void *&user_snp_ctx) override {
@@ -225,6 +222,7 @@ public:
     }
 
 private:
+    // TODO: Read from column families when log entries have expired
     class SnapshotContext {
     public:
         SnapshotContext(

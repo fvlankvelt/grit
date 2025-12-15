@@ -39,7 +39,24 @@ private:
 };
 
 
-class Transaction {
+class ItemStateContext {
+public:
+    virtual ~ItemStateContext() = default;
+
+    virtual bool IsExcluded(uint64_t otherTxId) const = 0;
+
+    static std::shared_ptr<ItemStateContext> Get(const std::shared_ptr<ItemStateContext>& defaultContext) {
+        return threadContext == nullptr ? defaultContext : threadContext;
+    }
+
+    static void Set(const std::shared_ptr<ItemStateContext>& context) {
+        threadContext = context;
+    }
+private:
+    inline static thread_local std::shared_ptr<ItemStateContext> threadContext;
+};
+
+class Transaction : public ItemStateContext {
 public:
     Transaction(
         const uint64_t txId,
@@ -53,7 +70,7 @@ public:
 
     uint64_t GetLastLogIdx() const { return lastLogIdx; }
 
-    bool IsExcluded(uint64_t otherTxId) const {
+    bool IsExcluded(uint64_t otherTxId) const override {
         return otherTxId > txId || inProgress.find(otherTxId) != inProgress.end();
     }
 
@@ -78,7 +95,7 @@ private:
     std::set<VertexId> touched;
 };
 
-class TransactionManager {
+class TransactionManager : public ItemStateContext {
 public:
     TransactionManager() {
     }
@@ -182,7 +199,12 @@ public:
 
     bool IsInvalid(uint64_t txId) const {
         std::shared_lock lock(invalid_mutex);
-        return invalid.find(txId) != invalid.end();
+        return invalid.contains(txId);
+    }
+
+    bool IsExcluded(uint64_t txId) const override {
+        std::shared_lock lock(db_mutex);
+        return inProgress.contains(txId);
     }
 
     void Commit(const Transaction &txn, WriteContext &ctx) {

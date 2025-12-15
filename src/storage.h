@@ -37,20 +37,19 @@ public:
     }
 };
 
-inline thread_local std::shared_ptr<Transaction> mergeThreadContext;
-
-class MergeGuard {
+class ItemStateContextGuard {
 public:
-    MergeGuard(const std::shared_ptr<Transaction> &txn) : txn(txn) {
-        mergeThreadContext = txn;
+    explicit ItemStateContextGuard(const std::shared_ptr<ItemStateContext> &txn) {
+        prev = ItemStateContext::Get(nullptr);
+        ItemStateContext::Set(txn);
     }
 
-    ~MergeGuard() {
-        mergeThreadContext = nullptr;
+    ~ItemStateContextGuard() {
+        ItemStateContext::Set(prev);
     }
 
 private:
-    std::shared_ptr<Transaction> txn;
+    std::shared_ptr<ItemStateContext> prev;
 };
 
 
@@ -68,24 +67,18 @@ public:
 
     bool FullMergeV2(
         const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
-        storage::ItemState state;
-        if (merge_in.existing_value) {
-            storage::ItemState existingState;
-            auto strValue = merge_in.existing_value->ToString();
-            existingState.ParseFromString(strValue);
-            state.set_action(existingState.action());
-        } else {
-            state.set_action(storage::DELETE);
-        }
+        std::shared_ptr<ItemStateContext> context = ItemStateContext::Get(txMgr);
 
-        bool foundValid = false;
-        uint32_t num_invalid = 0;
+        storage::ItemState state;
+        storage::ItemAction action(storage::DELETE);
+
+        bool found = false;
         auto operands = merge_in.operand_list;
         state.set_numoperands(operands.size());
         for (auto &operand: std::ranges::reverse_view(operands)) {
             storage::ItemOperation op;
             op.ParseFromString(operand.ToString());
-            if (mergeThreadContext != nullptr && mergeThreadContext->IsExcluded(op.txid())) {
+            if (context->IsExcluded(op.txid())) {
                 switch (op.action()) {
                     case storage::DELETE:
                         state.add_deletesinprogress(op.txid());
@@ -98,13 +91,42 @@ public:
                 }
                 continue;
             }
-            if (txMgr->IsInvalid(op.txid())) {
-                num_invalid++;
-            } else if (!foundValid) {
-                foundValid = true;
-                state.set_action(op.action());
+            if (!found && !txMgr->IsInvalid(op.txid())) {
+                action = op.action();
+                found = true;
             }
         }
+
+        if (merge_in.existing_value) {
+            storage::ItemState existingState;
+            auto strValue = merge_in.existing_value->ToString();
+            existingState.ParseFromString(strValue);
+
+            // one of the in-progress transactions may have committed since the snapshot was created
+            action = existingState.action();
+            for (const auto &txId: existingState.putsinprogress()) {
+                if (context->IsExcluded(txId)) {
+                    state.add_putsinprogress(txId);
+                    continue;
+                }
+                if (!found && !txMgr->IsInvalid(txId)) {
+                    found = true;
+                    action = storage::PUT;
+                }
+            }
+            for (const auto &txId: existingState.deletesinprogress()) {
+                if (context->IsExcluded(txId)) {
+                    state.add_deletesinprogress(txId);
+                    continue;
+                }
+                if (!found && !txMgr->IsInvalid(txId)) {
+                    found = true;
+                    action = storage::DELETE;
+                }
+            }
+        }
+
+        state.set_action(action);
         merge_out->new_value = state.SerializeAsString();
         return true;
     }
@@ -131,8 +153,8 @@ public:
         return state.action() == storage::DELETE;
     }
 
-    bool FilterMergeOperand(int /*level*/, const rocksdb::Slice& /*key*/,
-                                    const rocksdb::Slice& operand) const override {
+    bool FilterMergeOperand(int /*level*/, const rocksdb::Slice & /*key*/,
+                            const rocksdb::Slice &operand) const override {
         storage::ItemOperation op;
         op.ParseFromString(operand.ToString());
         return txMgr->IsInvalid(op.txid());

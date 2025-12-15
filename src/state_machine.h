@@ -100,42 +100,42 @@ public:
         return WriteBuffer(response);
     }
 
-    ptr<WriteTransaction> OpenWriteTransaction(const api::OpenRequest &request, WriteContext &ctx) {
+    ptr<WriteTransaction> OpenWriteTransaction(const api::OpenRequest &request, WriteContext &ctx) const {
         ptr<WriteTransaction> txn(graph->OpenForWrite(ctx));
         return txn;
     }
 
-    void Commit(const api::Transaction &request, WriteContext &ctx) {
+    void Commit(const api::Transaction &request, WriteContext &ctx) const {
         uint64_t txId = request.txid();
         Tx(txId)->Commit(ctx);
     }
 
-    void Rollback(const api::Transaction &request, WriteContext &ctx) {
+    void Rollback(const api::Transaction &request, WriteContext &ctx) const {
         uint64_t txId = request.txid();
         Tx(txId)->Rollback(ctx);
     }
 
-    void AddVertex(const api::AddVertexRequest &request, WriteContext &ctx) {
+    void AddVertex(const api::AddVertexRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->AddVertex(
             {request.vertexid().type(), request.vertexid().id()}, ctx);
     }
 
-    void RemoveVertex(const api::RemoveVertexRequest &request, WriteContext &ctx) {
+    void RemoveVertex(const api::RemoveVertexRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->RemoveVertex(
             {request.vertexid().type(), request.vertexid().id()}, ctx);
     }
 
-    void AddLabel(const api::AddLabelRequest &request, WriteContext &ctx) {
+    void AddLabel(const api::AddLabelRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->AddLabel(
             {request.vertexid().type(), request.vertexid().id()}, request.label(), ctx);
     }
 
-    void RemoveLabel(const api::RemoveLabelRequest &request, WriteContext &ctx) {
+    void RemoveLabel(const api::RemoveLabelRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->RemoveLabel(
             {request.vertexid().type(), request.vertexid().id()}, request.label(), ctx);
     }
 
-    void AddEdge(const api::AddEdgeRequest &request, WriteContext &ctx) {
+    void AddEdge(const api::AddEdgeRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->AddEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
@@ -144,7 +144,7 @@ public:
         );
     }
 
-    void RemoveEdge(const api::RemoveEdgeRequest &request, WriteContext &ctx) {
+    void RemoveEdge(const api::RemoveEdgeRequest &request, WriteContext &ctx) const {
         Tx(request.txid())->RemoveEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
@@ -189,7 +189,7 @@ public:
         if (user_snp_ctx == nullptr) {
             user_snp_ctx = new SnapshotContext(graph, obj_id, last_commit_index());
         }
-        SnapshotContext *ctx = static_cast<SnapshotContext *>(user_snp_ctx);
+        auto ctx = static_cast<SnapshotContext *>(user_snp_ctx);
         if (ctx->Read(data_out)) {
             // continue with a new snapshot if handling of previous one took too long
             // for recent raft log to be applicable.
@@ -226,8 +226,7 @@ private:
             const ptr<Graph> &graph,
             uint64_t start_log_idx,
             uint64_t end_log_idx
-        ) : graph(graph),
-            end_log_idx(end_log_idx),
+        ) : end_log_idx(end_log_idx),
             end_log_slice(rocksdb::EncodeU64Ts(end_log_idx, &end_log_str)),
             start_log_slice(rocksdb::EncodeU64Ts(start_log_idx, &start_log_str)) {
             rocksdb::ReadOptions readOptions;
@@ -239,7 +238,7 @@ private:
             iter->SeekToLast();
         }
 
-        bool Read(ptr<buffer> &data_out) {
+        bool Read(ptr<buffer> &data_out) const {
             data_out = buffer::expand(*data_out, SNAPSHOT_BUFFER_SIZE);
             return ReadFromIterator(iter, data_out);
         }
@@ -251,7 +250,6 @@ private:
     private:
         ptr<rocksdb::Iterator> iter;
 
-        ptr<Graph> graph;
         uint64_t end_log_idx;
         std::string end_log_str;
         rocksdb::Slice end_log_slice;
@@ -294,7 +292,7 @@ private:
         }
     }
 
-    ptr<WriteTransaction> Tx(uint64_t txId) {
+    ptr<WriteTransaction> Tx(uint64_t txId) const {
         return cs_new<WriteTransaction>(graph->GetStorage(), graph->txMgr, graph->txMgr->GetWriteTxn(txId));
     }
 

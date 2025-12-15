@@ -42,7 +42,6 @@ message ItemOperation {
 message ItemState {
     ItemAction action = 1;
     uint32 numOperands = 2;
-    uint32 numInvalid = 3;
-    repeated uint64 putsInProgress = 4;
-    repeated uint64 deletesInProgress = 5;
+    repeated uint64 putsInProgress = 3;
+    repeated uint64 deletesInProgress = 4;
 }

@@ -2,7 +2,9 @@
 
 #include <cassert>
 #include <memory>
+#include <queue>
 #include <sstream>
+#include <utility>
 
 #include "encoding.h"
 #include "graph.h"
@@ -13,17 +15,6 @@
 #include "rocksdb/merge_operator.h"
 #include "transaction.h"
 
-using namespace std;
-
-inline const std::string ToHex(const rocksdb::Slice &slice) {
-    std::stringstream ss;
-    ss << "0x";
-    for (int i = 0; i < slice.size(); i++) {
-        ss << std::format("{:02x}", slice.data()[i]);
-    }
-    return ss.str();
-}
-
 template<class T>
 class EntryIterator {
 public:
@@ -32,9 +23,8 @@ public:
         const rocksdb::Slice &prefix,
         const std::shared_ptr<Transaction> &txn)
         : txn(txn), prefixStr(prefix.data(), prefix.size()), prefixSlice(prefixStr), upstream(upstream) {
-        comparator = rocksdb::BytewiseComparatorWithU64Ts();
         {
-            MergeGuard guard(txn);
+            ItemStateContextGuard guard(txn);
             upstream->Seek(prefix);
         }
     }
@@ -49,14 +39,14 @@ public:
      * Proceed to next key.  Skip older updates to a key and updates from excluded transactions.
      */
     void Next() {
-        MergeGuard guard(txn);
+        ItemStateContextGuard guard(txn);
 
         bool foundKey = false;
         while (!foundKey && upstream->Valid() && IsValidKey(upstream->key())) {
             storage::ItemState value;
             value.ParseFromString(upstream->value().ToString());
             currentKey = upstream->key().ToString();
-            assert(upstream->key().ToString().compare(currentKey) == 0);
+            assert(upstream->key().ToString() == currentKey);
 
             // don't report deleted keys
             if (value.action() == storage::PUT) {
@@ -64,10 +54,7 @@ public:
                 foundKey = true;
             }
 
-            // skip all remaining entries for the same key
-            while (upstream->Valid() && upstream->key().ToString().compare(currentKey) == 0) {
-                upstream->Next();
-            }
+            upstream->Next();
         }
 
         if (!foundKey) {
@@ -90,7 +77,6 @@ private:
 
     std::string currentKey;
     const std::shared_ptr<Transaction> txn;
-    const rocksdb::Comparator *comparator;
     std::string prefixStr;
     rocksdb::Slice prefixSlice;
     std::unique_ptr<rocksdb::Iterator> upstream;
@@ -107,11 +93,11 @@ public:
     }
 
 protected:
-    void populate(const rocksdb::Slice &keySlice) {
+    void populate(const rocksdb::Slice &keySlice) override {
         encoding(keySlice).get_vertex(current);
     }
 
-    std::string ToString(VertexId id) {
+    std::string ToString(VertexId id) override {
         std::stringstream ss;
         ss << id.type << ":" << id.id;
         return ss.str();
@@ -129,14 +115,14 @@ public:
     }
 
 protected:
-    void populate(const rocksdb::Slice &keySlice) {
+    void populate(const rocksdb::Slice &keySlice) override {
         std::string label;
         encoding(keySlice)
                 .get_string(label)
                 .get_vertex(current);
     }
 
-    std::string ToString(VertexId id) {
+    std::string ToString(VertexId id) override {
         std::stringstream ss;
         ss << id.type << ":" << id.id;
         return ss.str();
@@ -154,11 +140,12 @@ public:
     }
 
 protected:
-    void populate(const rocksdb::Slice &keySlice) {
-        encoding(keySlice).get_string(current);
+    void populate(const rocksdb::Slice &keySlice) override {
+        VertexId vid;
+        encoding(keySlice).get_vertex(vid).get_string(current);
     }
 
-    std::string ToString(std::string current) { return current; }
+    std::string ToString(std::string current) override { return current; }
 };
 
 class EdgeIterator : public EntryIterator<Edge> {
@@ -172,15 +159,123 @@ public:
     }
 
 protected:
-    void populate(const rocksdb::Slice &keySlice) {
+    void populate(const rocksdb::Slice &keySlice) override {
         encoding(keySlice).get_edge(current);
     }
 
-    std::string ToString(Edge edge) {
+    std::string ToString(Edge edge) override {
         std::stringstream ss;
         ss << edge.direction << " " << edge.label << " " << edge.vertexId.id << " - "
                 << edge.otherId.id;
         return ss.str();
+    }
+};
+
+struct SlicingStats {
+    SlicingStats() : numKeys(0), numOperations(0) {
+    }
+
+    int32_t numKeys;
+    int32_t numOperations;
+};
+
+template<class T>
+constexpr bool operator<(const std::pair<T, SlicingStats> &a, const std::pair<T, SlicingStats> &b) {
+    // We want the biggest bang for the buck.  So keys with most operations to compact should remain.
+    // There is a cost for writing more keys though.
+    //
+    // The top of the priority queue is the key with the least improvement.  (so it can be easily dropped)
+    // For the priority sorting, keys to retain should therefore be *smaller* than the ones with less operations.
+    return a.second.numOperations - 3 * a.second.numKeys > b.second.numOperations - 3 * b.second.numKeys ;
+}
+
+template<class T>
+class SlicingCollector {
+public:
+    explicit SlicingCollector(int topN) : top_n_(topN) {
+    }
+
+    virtual ~SlicingCollector() = default;
+
+    std::vector<std::pair<T, SlicingStats> > Collect(const std::shared_ptr<rocksdb::Iterator> &iter) {
+        std::priority_queue<std::pair<T, SlicingStats> > items;
+
+        bool first = true;
+        T prev;
+        SlicingStats stats;
+        while (iter->Valid()) {
+            const T item = map(iter->key());
+            if (first || !equal(item, prev)) {
+                if (!first) {
+                    items.push(std::pair(item, stats));
+                    if (items.size() > top_n_) {
+                        items.pop();
+                    }
+                }
+                first = false;
+                stats = SlicingStats();
+                prev = item;
+            }
+            storage::ItemState state;
+            state.ParseFromString(iter->value().ToString());
+
+            stats.numKeys++;
+            stats.numOperations += state.numoperands();
+
+            iter->Next();
+        }
+        if (!first) {
+            items.push(std::pair(prev, stats));
+            if (items.size() > top_n_) {
+                items.pop();
+            }
+        }
+
+        std::vector<std::pair<T, SlicingStats> > results (items.size());
+        while (!items.empty()) {
+            results.emplace_back(items.top());
+            items.pop();
+        }
+        return results;
+    }
+
+    virtual T map(const rocksdb::Slice &key) const = 0;
+
+    virtual bool equal(const T &a, const T &b) const = 0;
+
+private:
+    int top_n_;
+};
+
+class VertexSlicingCollector : public SlicingCollector<VertexId> {
+public:
+    explicit VertexSlicingCollector(int topN = 100) : SlicingCollector(topN) {
+    }
+
+    VertexId map(const rocksdb::Slice &key) const override {
+        VertexId vid;
+        encoding(key).get_vertex(vid);
+        return vid;
+    }
+
+    bool equal(const VertexId &a, const VertexId &b) const override {
+        return a.type == b.type && a.id == b.id;
+    }
+};
+
+class LabelSlicingCollector : public SlicingCollector<std::string> {
+public:
+    explicit LabelSlicingCollector(int topN = 100) : SlicingCollector(topN) {
+    }
+
+    std::string map(const rocksdb::Slice &key) const override {
+        std::string label;
+        encoding(key).get_string(label);
+        return label;
+    }
+
+    bool equal(const std::string &a, const std::string &b) const override {
+        return a == b;
     }
 };
 
@@ -235,13 +330,32 @@ public:
             txn);
     }
 
+    // collect the top labels with the most churn - candidates for slicing
+    std::vector<std::pair<std::string, SlicingStats> > GetTopLabelsByChurn() const {
+        LabelSlicingCollector collector;
+        return collector.Collect(
+            std::shared_ptr<rocksdb::Iterator>(storage.db->NewIterator(readOptions, storage.index)));
+    }
+
+    // collect the top vertices with the most churn of labels - candidates for slicing
+    std::vector<std::pair<VertexId, SlicingStats> > GetTopVerticesByLabelChurn() const {
+        VertexSlicingCollector collector;
+        return collector.Collect(
+            std::shared_ptr<rocksdb::Iterator>(storage.db->NewIterator(readOptions, storage.labels)));
+    }
+
+    // collect the top labels with the most churn of edges - candidates for slicing
+    std::vector<std::pair<VertexId, SlicingStats> > GetTopVerticesByEdgeChurn() const {
+        VertexSlicingCollector collector;
+        return collector.Collect(
+            std::shared_ptr<rocksdb::Iterator>(storage.db->NewIterator(readOptions, storage.edges)));
+    }
+
 protected:
     rocksdb::ReadOptions readOptions;
 
-    std::string log_start_str;
     rocksdb::Slice log_window_end;
     std::string log_end_str;
-    rocksdb::Slice log_window_start;
     std::shared_ptr<Transaction> txn;
     const Storage &storage;
 };
@@ -249,7 +363,7 @@ protected:
 class WriteTransaction : public ReadTransaction {
 public:
     WriteTransaction(const Storage &storage, const std::shared_ptr<TransactionManager> &txMgr,
-                     std::shared_ptr<Transaction> txn)
+                     const std::shared_ptr<Transaction> &txn)
         : ReadTransaction(storage, txn), txMgr(txMgr) {
         storage::ItemOperation put;
         put.set_action(storage::PUT);
@@ -262,7 +376,7 @@ public:
         delSlice = del.SerializeAsString();
     }
 
-    virtual bool IsReadOnly() { return false; }
+    bool IsReadOnly() override { return false; }
 
     void AddVertex(const VertexId &vertexId, WriteContext &ctx) const {
         Put(storage.vertices, ctx, encoding().put_vertex(vertexId).ToSlice());
@@ -303,7 +417,7 @@ public:
         txMgr->Touch(*txn, ctx, vertexId);
     }
 
-    void RemoveLabel(const VertexId &vertexId, const std::string label, WriteContext &ctx) const {
+    void RemoveLabel(const VertexId &vertexId, const std::string &label, WriteContext &ctx) const {
         Delete(storage.index, ctx,
                encoding().put_string(label).put_vertex(vertexId).ToSlice()
         );
@@ -320,7 +434,7 @@ public:
         txMgr->Touch(*txn, ctx, to);
     }
 
-    void RemoveEdge(const std::string &label, const VertexId &from, const VertexId &to, WriteContext& ctx) const {
+    void RemoveEdge(const std::string &label, const VertexId &from, const VertexId &to, WriteContext &ctx) const {
         RemoveEdgeWithDirection(label, OUT, from, to, ctx);
         RemoveEdgeWithDirection(label, IN, to, from, ctx);
         txMgr->Touch(*txn, ctx, from);
@@ -339,7 +453,7 @@ private:
         const Direction direction,
         const VertexId &vertex,
         const VertexId &other,
-        WriteContext& ctx) const {
+        WriteContext &ctx) const {
         Put(storage.edges, ctx,
             encoding().put_edge({vertex, other, label, direction}).ToSlice()
         );
@@ -371,9 +485,56 @@ private:
     std::shared_ptr<TransactionManager> txMgr;
 };
 
+/*
+ * Slicing is done outside a transactional context.  Since it Puts and Deletes keys, these cannot be filtered out later
+ * by the merge operator.  (they form the starting point of the list of operands)  Slicing achieves effectively the same
+ * as a compaction - but on a finer grained level.
+ */
+class Slicer {
+public:
+    explicit Slicer(const Storage &storage) : storage(storage) {
+    }
+
+    void SliceIndex(const std::string &label, WriteContext &ctx) const {
+        SlicePrefix(storage.index, encoding().put_string(label).ToString(), ctx);
+    }
+
+    void SliceLabels(const VertexId &vid, WriteContext &ctx) const {
+        SlicePrefix(storage.labels, encoding().put_vertex(vid).ToString(), ctx);
+    }
+
+    void SliceEdges(const VertexId &vid, WriteContext &ctx) const {
+        SlicePrefix(storage.edges, encoding().put_vertex(vid).ToString(), ctx);
+    }
+
+private:
+    void SlicePrefix(rocksdb::ColumnFamilyHandle *cf, const std::string &prefix, WriteContext &ctx) const {
+        rocksdb::ReadOptions readOptions;
+        std::string tsStr;
+        rocksdb::Slice tsSlice = rocksdb::EncodeU64Ts(-1, &tsStr);
+        readOptions.timestamp = &tsSlice;
+
+        rocksdb::Iterator *upstream = storage.db->NewIterator(readOptions, cf);
+        upstream->Seek(prefix);
+        while (upstream->Valid() && upstream->key().starts_with(prefix)) {
+            storage::ItemState value;
+            value.ParseFromString(upstream->value().ToString());
+            const rocksdb::Slice &currentKey = upstream->key();
+            if (value.action() == storage::PUT || value.putsinprogress_size() > 0) {
+                ctx.wb.Put(cf, currentKey, upstream->value().ToString());
+            } else {
+                ctx.wb.Delete(cf, currentKey);
+            }
+            upstream->Next();
+        }
+    }
+
+    const Storage &storage;
+};
+
 class Graph {
 public:
-    explicit Graph(const Storage &storage) : storage(storage), txMgr(storage.GetTransactionManager()) {
+    explicit Graph(const Storage &storage) : txMgr(storage.GetTransactionManager()), storage(storage) {
     }
 
     ReadTransaction *OpenForRead(uint64_t txId = 0) {
@@ -382,6 +543,10 @@ public:
 
     WriteTransaction *OpenForWrite(WriteContext &ctx) {
         return new WriteTransaction(storage, txMgr, txMgr->OpenForWrite(ctx));
+    }
+
+    Slicer *OpenSlicer(WriteContext &ctx) {
+        return new Slicer(storage);
     }
 
     friend class StateMachine;

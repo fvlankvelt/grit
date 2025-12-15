@@ -172,7 +172,7 @@ public:
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
         VertexId vertexId = {request->vertexid().type(), request->vertexid().id()};
         return WriteItems<std::string, api::Label>(writer, txn->GetLabels(vertexId),
-                                                   [](const string &label, api::Label &out) {
+                                                   [](const std::string &label, api::Label &out) {
                                                        out.set_label(label);
                                                    });
     }

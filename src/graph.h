@@ -2,12 +2,12 @@
 
 #include <cassert>
 #include <memory>
-#include <ranges>
 #include <sstream>
 
 #include "encoding.h"
 #include "graph.h"
 #include "model.h"
+#include "storage.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/db.h"
 #include "rocksdb/merge_operator.h"
@@ -15,7 +15,7 @@
 
 using namespace std;
 
-const std::string ToHex(const rocksdb::Slice &slice) {
+inline const std::string ToHex(const rocksdb::Slice &slice) {
     std::stringstream ss;
     ss << "0x";
     for (int i = 0; i < slice.size(); i++) {
@@ -23,98 +23,6 @@ const std::string ToHex(const rocksdb::Slice &slice) {
     }
     return ss.str();
 }
-
-inline thread_local std::shared_ptr<Transaction> mergeThreadContext;
-
-class MergeGuard {
-public:
-    MergeGuard(const std::shared_ptr<Transaction> &txn) : txn(txn) {
-        mergeThreadContext = txn;
-    }
-
-    ~MergeGuard() {
-        mergeThreadContext = nullptr;
-    }
-
-private:
-    std::shared_ptr<Transaction> txn;
-};
-
-/**
- * Merge updates to a key, filtering out those created by invalid transactions.
- * Should only be used on time ranges that exclude the "active window" as in-progress
- * transactions are still undecided.
- */
-class TxMergeOperator : public rocksdb::MergeOperator {
-public:
-    TxMergeOperator(const shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
-    }
-
-    const char *Name() const override { return "TxMergeOperator"; }
-
-    bool FullMergeV2(
-        const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
-        MergeValue value;
-        if (merge_in.existing_value) {
-            merge_out->new_value = merge_in.existing_value->ToString(false);
-        } else {
-            value.action = DELETE;
-            value.txId = 0;
-            merge_out->new_value = encoding().put_merge(value).ToString();
-        }
-
-        auto operands = merge_in.operand_list;
-        for (auto &operand: std::ranges::reverse_view(operands)) {
-            encoding(operand).get_merge(value);
-            if (mergeThreadContext != nullptr && mergeThreadContext->IsExcluded(value.txId)) {
-                continue;
-            }
-            if (!txMgr->IsInvalid(value.txId)) {
-                merge_out->new_value = operand.ToString();
-                break;
-            }
-        }
-        return true;
-    }
-
-private:
-    std::shared_ptr<TransactionManager> txMgr;
-};
-
-class TxCompactionFilter : public rocksdb::CompactionFilter {
-public:
-    TxCompactionFilter(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
-    }
-
-    const char *Name() const override { return "TxCompactionFilter"; }
-
-    bool Filter(
-        int level,
-        const rocksdb::Slice &key,
-        const rocksdb::Slice &existing_value,
-        std::string *new_value,
-        bool *value_changed) const override {
-        MergeValue value;
-        encoding(existing_value).get_merge(value);
-
-        // what to do in this case?
-        assert(!txMgr->IsInvalid(value.txId));
-        return value.action == DELETE;
-    }
-
-private:
-    std::shared_ptr<TransactionManager> txMgr;
-};
-
-struct Storage {
-    rocksdb::DB *db;
-    rocksdb::ColumnFamilyHandle *_default;
-    rocksdb::ColumnFamilyHandle *index;
-    rocksdb::ColumnFamilyHandle *vertices;
-    rocksdb::ColumnFamilyHandle *edges;
-    rocksdb::ColumnFamilyHandle *labels;
-    rocksdb::ColumnFamilyHandle *raft_log;
-};
 
 template<class T>
 class EntryIterator {
@@ -281,8 +189,8 @@ public:
     ReadTransaction(const Storage &storage, const std::shared_ptr<Transaction> &txn)
         : storage(storage), txn(txn) {
         log_window_end = rocksdb::EncodeU64Ts(txn->GetLastLogIdx(), &log_end_str);
-        frozenReadOptions.timestamp = &log_window_end;
-        frozenReadOptions.total_order_seek = true;
+        readOptions.timestamp = &log_window_end;
+        readOptions.total_order_seek = true;
     }
 
     virtual ~ReadTransaction() = default;
@@ -293,21 +201,21 @@ public:
 
     std::shared_ptr<VertexIterator> GetVerticesByType(const std::string &type) const {
         return std::make_shared<VertexIterator>(
-            storage.db->NewIterator(frozenReadOptions, storage.vertices),
+            storage.db->NewIterator(readOptions, storage.vertices),
             encoding().put_string(type).ToSlice(),
             txn);
     }
 
     std::shared_ptr<IndexVertexIterator> GetVerticesByLabel(const std::string &label, const std::string &type) const {
         return std::make_shared<IndexVertexIterator>(
-            storage.db->NewIterator(frozenReadOptions, storage.index),
+            storage.db->NewIterator(readOptions, storage.index),
             encoding().put_string(label).put_string(type).ToSlice(),
             txn);
     }
 
     std::shared_ptr<LabelIterator> GetLabels(const VertexId &vertexId) const {
         return std::make_shared<LabelIterator>(
-            storage.db->NewIterator(frozenReadOptions, storage.labels),
+            storage.db->NewIterator(readOptions, storage.labels),
             encoding().put_vertex(vertexId).ToSlice(),
             txn);
     }
@@ -315,20 +223,20 @@ public:
     std::shared_ptr<EdgeIterator> GetEdges(
         const VertexId &vertexId, const std::string &label, const Direction direction) const {
         return std::make_shared<EdgeIterator>(
-            storage.db->NewIterator(frozenReadOptions, storage.edges),
+            storage.db->NewIterator(readOptions, storage.edges),
             encoding().put_vertex(vertexId).put_string(label).put_direction(direction).ToSlice(),
             txn);
     }
 
     std::shared_ptr<EdgeIterator> GetEdges(const VertexId &vertexId) const {
         return std::make_shared<EdgeIterator>(
-            storage.db->NewIterator(frozenReadOptions, storage.edges),
+            storage.db->NewIterator(readOptions, storage.edges),
             encoding().put_vertex(vertexId).ToSlice(),
             txn);
     }
 
 protected:
-    rocksdb::ReadOptions frozenReadOptions;
+    rocksdb::ReadOptions readOptions;
 
     std::string log_start_str;
     rocksdb::Slice log_window_end;
@@ -355,21 +263,19 @@ public:
 
     virtual bool IsReadOnly() { return false; }
 
-    void AddVertex(const VertexId &vertexId, const ulong raft_log_idx) const {
-        Put(storage.vertices, raft_log_idx, encoding().put_vertex(vertexId).ToSlice());
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+    void AddVertex(const VertexId &vertexId, WriteContext &ctx) const {
+        Put(storage.vertices, ctx, encoding().put_vertex(vertexId).ToSlice());
+        txMgr->Touch(*txn, ctx, vertexId);
     }
 
-    void RemoveVertex(const VertexId &vertexId, const ulong raft_log_idx) const {
-        txn->Touch(vertexId);
-
+    void RemoveVertex(const VertexId &vertexId, WriteContext &ctx) const {
         const std::shared_ptr edges(GetEdges(vertexId));
         while (edges->Valid()) {
             const Edge &edge = edges->Get();
             if (edge.direction == OUT) {
-                RemoveEdge(edge.label, edge.vertexId, edge.otherId, raft_log_idx);
+                RemoveEdge(edge.label, edge.vertexId, edge.otherId, ctx);
             } else {
-                RemoveEdge(edge.label, edge.otherId, edge.vertexId, raft_log_idx);
+                RemoveEdge(edge.label, edge.otherId, edge.vertexId, ctx);
             }
             edges->Next();
         }
@@ -377,60 +283,54 @@ public:
         const std::shared_ptr labels(GetLabels(vertexId));
         while (labels->Valid()) {
             const std::string &label = labels->Get();
-            RemoveLabel(vertexId, label, raft_log_idx);
+            RemoveLabel(vertexId, label, ctx);
             labels->Next();
         }
 
-        Delete(storage.vertices, raft_log_idx, encoding().put_vertex(vertexId).ToSlice());
+        Delete(storage.vertices, ctx, encoding().put_vertex(vertexId).ToSlice());
 
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+        txMgr->Touch(*txn, ctx, vertexId);
     }
 
-    void AddLabel(const VertexId &vertexId, const std::string &label, const ulong raft_log_idx) const {
-        txn->Touch(vertexId);
-        Put(storage.index, raft_log_idx,
+    void AddLabel(const VertexId &vertexId, const std::string &label, WriteContext &ctx) const {
+        Put(storage.index, ctx,
             encoding().put_string(label).put_vertex(vertexId).ToSlice()
         );
-        Put(storage.labels, raft_log_idx,
+        Put(storage.labels, ctx,
             encoding().put_vertex(vertexId).put_string(label).ToSlice()
         );
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+        txMgr->Touch(*txn, ctx, vertexId);
     }
 
-    void RemoveLabel(const VertexId &vertexId, const std::string label, const ulong raft_log_idx) const {
-        txn->Touch(vertexId);
-        Delete(storage.index, raft_log_idx,
+    void RemoveLabel(const VertexId &vertexId, const std::string label, WriteContext &ctx) const {
+        Delete(storage.index, ctx,
                encoding().put_string(label).put_vertex(vertexId).ToSlice()
         );
-        Delete(storage.labels, raft_log_idx,
+        Delete(storage.labels, ctx,
                encoding().put_vertex(vertexId).put_string(label).ToSlice()
         );
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+        txMgr->Touch(*txn, ctx, vertexId);
     }
 
-    void AddEdge(const std::string &label, const VertexId &from, const VertexId &to, const ulong raft_log_idx) const {
-        txn->Touch(from);
-        txn->Touch(to);
-        AddEdgeWithDirection(label, OUT, from, to, raft_log_idx);
-        AddEdgeWithDirection(label, IN, to, from, raft_log_idx);
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+    void AddEdge(const std::string &label, const VertexId &from, const VertexId &to, WriteContext &ctx) const {
+        AddEdgeWithDirection(label, OUT, from, to, ctx);
+        AddEdgeWithDirection(label, IN, to, from, ctx);
+        txMgr->Touch(*txn, ctx, from);
+        txMgr->Touch(*txn, ctx, to);
     }
 
-    void RemoveEdge(const std::string &label, const VertexId &from, const VertexId &to,
-                    const ulong raft_log_idx) const {
-        txn->Touch(from);
-        txn->Touch(to);
-        RemoveEdgeWithDirection(label, OUT, from, to, raft_log_idx);
-        RemoveEdgeWithDirection(label, IN, to, from, raft_log_idx);
-        txMgr->SaveTransaction(*txn, raft_log_idx);
+    void RemoveEdge(const std::string &label, const VertexId &from, const VertexId &to, WriteContext& ctx) const {
+        RemoveEdgeWithDirection(label, OUT, from, to, ctx);
+        RemoveEdgeWithDirection(label, IN, to, from, ctx);
+        txMgr->Touch(*txn, ctx, from);
+        txMgr->Touch(*txn, ctx, to);
     }
 
-    uint64_t Commit(ulong raft_log_idx) const {
-        txMgr->Commit(*txn.get(), raft_log_idx);
-        return txn->GetTxId();
+    void Commit(WriteContext &ctx) const {
+        txMgr->Commit(*txn.get(), ctx);
     }
 
-    void Rollback(ulong raft_log_idx) const { txMgr->Rollback(txn->GetTxId(), raft_log_idx); }
+    void Rollback(WriteContext &ctx) const { txMgr->Rollback(txn->GetTxId(), ctx); }
 
 private:
     void AddEdgeWithDirection(
@@ -438,8 +338,8 @@ private:
         const Direction direction,
         const VertexId &vertex,
         const VertexId &other,
-        ulong raft_log_idx) const {
-        Put(storage.edges, raft_log_idx,
+        WriteContext& ctx) const {
+        Put(storage.edges, ctx,
             encoding().put_edge({vertex, other, label, direction}).ToSlice()
         );
     }
@@ -449,84 +349,38 @@ private:
         const Direction direction,
         const VertexId &vertex,
         const VertexId &other,
-        ulong raft_log_idx) const {
-        Delete(storage.edges, raft_log_idx,
+        WriteContext &ctx) const {
+        Delete(storage.edges, ctx,
                encoding().put_edge({vertex, other, label, direction}).ToSlice()
         );
     }
 
-    void Put(rocksdb::ColumnFamilyHandle *handle, ulong raft_log_idx, const rocksdb::Slice &key) const {
-        std::string logStr;
-        rocksdb::Status status = storage.db->Merge(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
-                                                   putEnc.ToSlice());
+    void Put(rocksdb::ColumnFamilyHandle *handle, WriteContext &ctx, const rocksdb::Slice &key) const {
+        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, putEnc.ToSlice());
         assert(status.ok());
     }
 
-    void Delete(rocksdb::ColumnFamilyHandle *handle, ulong raft_log_idx, const rocksdb::Slice &key) const {
-        std::string logStr;
-        rocksdb::Status status = storage.db->Merge(wo, handle, key, rocksdb::EncodeU64Ts(raft_log_idx, &logStr),
-                                                   delEnc.ToSlice());
+    void Delete(rocksdb::ColumnFamilyHandle *handle, WriteContext &ctx, const rocksdb::Slice &key) const {
+        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, delEnc.ToSlice());
         assert(status.ok());
     }
 
     encoding putEnc;
     encoding delEnc;
     std::shared_ptr<TransactionManager> txMgr;
-    rocksdb::WriteOptions wo;
 };
 
 class Graph {
 public:
-    Graph(const std::string &path) : txMgr(make_shared<TransactionManager>()) {
-        rocksdb::Options options;
-        options.create_if_missing = true;
-        options.create_missing_column_families = true;
-
-        rocksdb::ColumnFamilyOptions cfOptions(options);
-        cfOptions.merge_operator.reset(new TxMergeOperator(txMgr));
-        cfOptions.comparator = rocksdb::BytewiseComparatorWithU64Ts();
-        compactionFilter.reset(new TxCompactionFilter(txMgr));
-        cfOptions.compaction_filter = compactionFilter.get();
-
-        std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor(rocksdb::kDefaultColumnFamilyName, cfOptions));
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("index", cfOptions));
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("vertices", cfOptions));
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("edges", cfOptions));
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("labels", cfOptions));
-        descriptors.push_back(rocksdb::ColumnFamilyDescriptor("raft_log", cfOptions));
-
-        std::vector<rocksdb::ColumnFamilyHandle *> handles;
-        rocksdb::Status status =
-                rocksdb::DB::Open(options, path, descriptors, &handles, &storage.db);
-        assert(status.ok());
-
-        storage._default = handles[0];
-        storage.index = handles[1];
-        storage.vertices = handles[2];
-        storage.edges = handles[3];
-        storage.labels = handles[4];
-        storage.raft_log = handles[5];
-
-        txMgr->Initialize(storage.db);
-    }
-
-    ~Graph() {
-        storage.db->DestroyColumnFamilyHandle(storage.raft_log);
-        storage.db->DestroyColumnFamilyHandle(storage.labels);
-        storage.db->DestroyColumnFamilyHandle(storage.edges);
-        storage.db->DestroyColumnFamilyHandle(storage.vertices);
-        storage.db->DestroyColumnFamilyHandle(storage.index);
-        storage.db->DestroyColumnFamilyHandle(storage._default);
-        storage.db->Close();
+    explicit Graph(const Storage &storage) : storage(storage), txMgr(storage.GetTransactionManager()) {
     }
 
     ReadTransaction *OpenForRead(uint64_t txId = 0) {
         return new ReadTransaction(storage, txMgr->OpenForRead(txId));
     }
 
-    WriteTransaction *OpenForWrite(ulong raft_log_idx) {
-        return new WriteTransaction(storage, txMgr, txMgr->OpenForWrite(raft_log_idx));
+    WriteTransaction *OpenForWrite(WriteContext &ctx) {
+        return new WriteTransaction(storage, txMgr, txMgr->OpenForWrite(ctx));
     }
 
     friend class StateMachine;
@@ -537,6 +391,5 @@ private:
     }
 
     std::shared_ptr<TransactionManager> txMgr;
-    Storage storage;
-    std::unique_ptr<rocksdb::CompactionFilter> compactionFilter;
+    const Storage &storage;
 };

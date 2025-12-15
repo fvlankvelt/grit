@@ -36,17 +36,14 @@ public:
     ptr<buffer> commit(const ulong log_idx, buffer &data) override {
         std::cout << "committing status " << log_idx << std::endl;
 
+        WriteContext ctx(graph->GetStorage().db, log_idx);
+
         // write a copy to the raft_log
         {
             size_t pos = data.pos();
-
-            rocksdb::WriteOptions writeOptions;
-            std::string txStr;
-            rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(log_idx, &txStr));
             size_t size = data.get_int();
             rocksdb::Slice logEntry(reinterpret_cast<const char *>(data.get_raw(size)), size);
-            auto status = graph->GetStorage().db->Put(writeOptions, graph->GetStorage().raft_log,
-                                                      "log", txSlice, logEntry);
+            auto status = ctx.wb.Put(graph->GetStorage().raft_log, "log", ctx.ts, logEntry);
             assert(status.ok());
 
             // reset buffer
@@ -58,7 +55,7 @@ public:
         ReadBuffer(entry, data);
         if (entry.has_open()) {
             const api::OpenRequest &request = entry.open();
-            ptr<WriteTransaction> txn = OpenWriteTransaction(request, log_idx);
+            ptr<WriteTransaction> txn = OpenWriteTransaction(request, ctx);
             api::Transaction response;
             response.set_type(api::WRITE);
             response.set_txid(txn->GetTxId());
@@ -67,21 +64,21 @@ public:
         api::TransactionResponse response;
         try {
             if (entry.has_commit()) {
-                Commit(entry.commit(), log_idx);
+                Commit(entry.commit(), ctx);
             } else if (entry.has_rollback()) {
-                Rollback(entry.rollback(), log_idx);
+                Rollback(entry.rollback(), ctx);
             } else if (entry.has_addvertex()) {
-                AddVertex(entry.addvertex(), log_idx);
+                AddVertex(entry.addvertex(), ctx);
             } else if (entry.has_removevertex()) {
-                RemoveVertex(entry.removevertex(), log_idx);
+                RemoveVertex(entry.removevertex(), ctx);
             } else if (entry.has_addlabel()) {
-                AddLabel(entry.addlabel(), log_idx);
+                AddLabel(entry.addlabel(), ctx);
             } else if (entry.has_removelabel()) {
-                RemoveLabel(entry.removelabel(), log_idx);
+                RemoveLabel(entry.removelabel(), ctx);
             } else if (entry.has_addedge()) {
-                AddEdge(entry.addedge(), log_idx);
+                AddEdge(entry.addedge(), ctx);
             } else if (entry.has_removeedge()) {
-                RemoveEdge(entry.removeedge(), log_idx);
+                RemoveEdge(entry.removeedge(), ctx);
             }
             response.set_status(api::OK);
         } catch (TransactionException te) {
@@ -103,68 +100,68 @@ public:
         return WriteBuffer(response);
     }
 
-    ptr<WriteTransaction> OpenWriteTransaction(const api::OpenRequest &request, ulong raft_log_idx) {
-        ptr<WriteTransaction> txn(graph->OpenForWrite(raft_log_idx));
+    ptr<WriteTransaction> OpenWriteTransaction(const api::OpenRequest &request, WriteContext &ctx) {
+        ptr<WriteTransaction> txn(graph->OpenForWrite(ctx));
         return txn;
     }
 
-    void Commit(const api::Transaction &request, ulong raft_log_idx) {
+    void Commit(const api::Transaction &request, WriteContext &ctx) {
         uint64_t txId = request.txid();
-        Tx(txId)->Commit(raft_log_idx);
+        Tx(txId)->Commit(ctx);
     }
 
-    void Rollback(const api::Transaction &request, ulong raft_log_idx) {
+    void Rollback(const api::Transaction &request, WriteContext &ctx) {
         uint64_t txId = request.txid();
-        Tx(txId)->Rollback(raft_log_idx);
+        Tx(txId)->Rollback(ctx);
     }
 
-    void AddVertex(const api::AddVertexRequest &request, ulong raft_log_idx) {
+    void AddVertex(const api::AddVertexRequest &request, WriteContext &ctx) {
         Tx(request.txid())->AddVertex(
-            {request.vertexid().type(), request.vertexid().id()}, raft_log_idx);
+            {request.vertexid().type(), request.vertexid().id()}, ctx);
     }
 
-    void RemoveVertex(const api::RemoveVertexRequest &request, ulong raft_log_idx) {
+    void RemoveVertex(const api::RemoveVertexRequest &request, WriteContext &ctx) {
         Tx(request.txid())->RemoveVertex(
-            {request.vertexid().type(), request.vertexid().id()}, raft_log_idx);
+            {request.vertexid().type(), request.vertexid().id()}, ctx);
     }
 
-    void AddLabel(const api::AddLabelRequest &request, ulong raft_log_idx) {
+    void AddLabel(const api::AddLabelRequest &request, WriteContext &ctx) {
         Tx(request.txid())->AddLabel(
-            {request.vertexid().type(), request.vertexid().id()}, request.label(), raft_log_idx);
+            {request.vertexid().type(), request.vertexid().id()}, request.label(), ctx);
     }
 
-    void RemoveLabel(const api::RemoveLabelRequest &request, ulong raft_log_idx) {
+    void RemoveLabel(const api::RemoveLabelRequest &request, WriteContext &ctx) {
         Tx(request.txid())->RemoveLabel(
-            {request.vertexid().type(), request.vertexid().id()}, request.label(), raft_log_idx);
+            {request.vertexid().type(), request.vertexid().id()}, request.label(), ctx);
     }
 
-    void AddEdge(const api::AddEdgeRequest &request, ulong raft_log_idx) {
+    void AddEdge(const api::AddEdgeRequest &request, WriteContext &ctx) {
         Tx(request.txid())->AddEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
             {request.tovertexid().type(), request.tovertexid().id()},
-            raft_log_idx
+            ctx
         );
     }
 
-    void RemoveEdge(const api::RemoveEdgeRequest &request, ulong raft_log_idx) {
+    void RemoveEdge(const api::RemoveEdgeRequest &request, WriteContext &ctx) {
         Tx(request.txid())->RemoveEdge(
             request.label(),
             {request.fromvertexid().type(), request.fromvertexid().id()},
             {request.tovertexid().type(), request.tovertexid().id()},
-            raft_log_idx
+            ctx
         );
     }
 
-    bool apply_snapshot(snapshot &s) {
+    bool apply_snapshot(snapshot &s) override {
         return true;
     }
 
-    ptr<snapshot> last_snapshot() {
+    ptr<snapshot> last_snapshot() override {
         return nullptr;
     }
 
-    ulong last_commit_index() {
+    ulong last_commit_index() override {
         rocksdb::ReadOptions readOptions;
         std::string txStr;
         rocksdb::Slice txSlice(rocksdb::EncodeU64Ts(-1, &txStr));
@@ -181,7 +178,7 @@ public:
     }
 
     void create_snapshot(snapshot &s,
-                         async_result<bool>::handler_type &when_done) {
+                         async_result<bool>::handler_type &when_done) override {
     }
 
     int read_logical_snp_obj(snapshot &s, void *&user_snp_ctx, ulong obj_id, ptr<buffer> &data_out,

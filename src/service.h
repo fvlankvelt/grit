@@ -293,8 +293,9 @@ inline void signalHandler(int signum) {
 
 inline void RunServer(int grpcPort, int raftPort, int raftId, std::vector<RaftPeer> peers,
                       const std::string &storagePath) {
+    Storage storage(storagePath);
     std::string server_address("0.0.0.0:" + std::to_string(grpcPort));
-    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>(storagePath), peers);
+    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>(storage), peers);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());

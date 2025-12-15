@@ -13,8 +13,14 @@ message InProgress {
 
 // Committed transactions are written so that conficts can be detected with to-be-committed transactions.
 message Transaction {
+    repeated bytes touched = 1;
+}
+
+message TransactionOperation {
     uint64 txId = 1;
-    repeated bytes touched = 2;
+    oneof op {
+        bytes touched = 2;
+    }
 }
 
 message TransactionManagerState {

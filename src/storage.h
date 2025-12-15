@@ -4,7 +4,6 @@
 #include <memory>
 #include <ranges>
 
-#include "encoding.h"
 #include "storage.pb.h"
 #include "transaction.h"
 #include "rocksdb/compaction_filter.h"
@@ -60,35 +59,53 @@ private:
  * Should only be used on time ranges that exclude the "active window" as in-progress
  * transactions are still undecided.
  */
-class MergeValueOperator : public rocksdb::MergeOperator {
+class ItemStateOperator : public rocksdb::MergeOperator {
 public:
-    MergeValueOperator(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
+    ItemStateOperator(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
     }
 
     const char *Name() const override { return "TxMergeOperator"; }
 
     bool FullMergeV2(
         const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
-        MergeValue value;
+        storage::ItemState state;
         if (merge_in.existing_value) {
-            merge_out->new_value = merge_in.existing_value->ToString(false);
+            storage::ItemState existingState;
+            auto strValue = merge_in.existing_value->ToString();
+            existingState.ParseFromString(strValue);
+            state.set_action(existingState.action());
         } else {
-            value.action = DELETE;
-            value.txId = 0;
-            merge_out->new_value = encoding().put_merge(value).ToString();
+            state.set_action(storage::DELETE);
         }
 
+        bool foundValid = false;
+        uint32_t num_invalid = 0;
         auto operands = merge_in.operand_list;
+        state.set_numoperands(operands.size());
         for (auto &operand: std::ranges::reverse_view(operands)) {
-            encoding(operand).get_merge(value);
-            if (mergeThreadContext != nullptr && mergeThreadContext->IsExcluded(value.txId)) {
+            storage::ItemOperation op;
+            op.ParseFromString(operand.ToString());
+            if (mergeThreadContext != nullptr && mergeThreadContext->IsExcluded(op.txid())) {
+                switch (op.action()) {
+                    case storage::DELETE:
+                        state.add_deletesinprogress(op.txid());
+                        break;
+                    case storage::PUT:
+                        state.add_putsinprogress(op.txid());
+                        break;
+                    default:
+                        break;
+                }
                 continue;
             }
-            if (!txMgr->IsInvalid(value.txId)) {
-                merge_out->new_value = operand.ToString();
-                break;
+            if (txMgr->IsInvalid(op.txid())) {
+                num_invalid++;
+            } else if (!foundValid) {
+                foundValid = true;
+                state.set_action(op.action());
             }
         }
+        merge_out->new_value = state.SerializeAsString();
         return true;
     }
 
@@ -96,9 +113,9 @@ private:
     std::shared_ptr<TransactionManager> txMgr;
 };
 
-class MergeValueFilter : public rocksdb::CompactionFilter {
+class ItemStateFilter : public rocksdb::CompactionFilter {
 public:
-    MergeValueFilter(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
+    explicit ItemStateFilter(const std::shared_ptr<TransactionManager> &txMgr) : txMgr(txMgr) {
     }
 
     const char *Name() const override { return "TxCompactionFilter"; }
@@ -109,12 +126,16 @@ public:
         const rocksdb::Slice &existing_value,
         std::string *new_value,
         bool *value_changed) const override {
-        MergeValue value;
-        encoding(existing_value).get_merge(value);
+        storage::ItemState state;
+        state.ParseFromString(existing_value.ToString());
+        return state.action() == storage::DELETE;
+    }
 
-        // what to do in this case?
-        assert(!txMgr->IsInvalid(value.txId));
-        return value.action == DELETE;
+    bool FilterMergeOperand(int /*level*/, const rocksdb::Slice& /*key*/,
+                                    const rocksdb::Slice& operand) const override {
+        storage::ItemOperation op;
+        op.ParseFromString(operand.ToString());
+        return txMgr->IsInvalid(op.txid());
     }
 
 private:
@@ -135,8 +156,8 @@ public:
         transactionOptions.merge_operator = std::make_shared<TransactionOperator>();
 
         rocksdb::ColumnFamilyOptions cfOptions(options);
-        cfOptions.merge_operator = std::make_shared<MergeValueOperator>(txMgr);
-        compactionFilter = std::make_shared<MergeValueFilter>(txMgr);
+        cfOptions.merge_operator = std::make_shared<ItemStateOperator>(txMgr);
+        compactionFilter = std::make_shared<ItemStateFilter>(txMgr);
         cfOptions.compaction_filter = compactionFilter.get();
 
         std::vector<rocksdb::ColumnFamilyDescriptor> descriptors;
@@ -175,7 +196,7 @@ public:
         db->Close();
     }
 
-    const std::shared_ptr<TransactionManager>& GetTransactionManager() const {
+    const std::shared_ptr<TransactionManager> &GetTransactionManager() const {
         return txMgr;
     }
 

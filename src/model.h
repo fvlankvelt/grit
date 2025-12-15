@@ -20,10 +20,3 @@ struct Edge {
     std::string label;
     Direction direction;
 };
-
-enum Action { PUT, DELETE};
-
-struct MergeValue {
-    Action action;
-    unsigned long txId;
-};

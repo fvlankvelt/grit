@@ -53,13 +53,13 @@ public:
 
         bool foundKey = false;
         while (!foundKey && upstream->Valid() && IsValidKey(upstream->key())) {
-            MergeValue value;
-            encoding(upstream->value()).get_merge(value);
+            storage::ItemState value;
+            value.ParseFromString(upstream->value().ToString());
             currentKey = upstream->key().ToString();
             assert(upstream->key().ToString().compare(currentKey) == 0);
 
             // don't report deleted keys
-            if (value.action == PUT) {
+            if (value.action() == storage::PUT) {
                 populate(currentKey);
                 foundKey = true;
             }
@@ -251,14 +251,15 @@ public:
     WriteTransaction(const Storage &storage, const std::shared_ptr<TransactionManager> &txMgr,
                      std::shared_ptr<Transaction> txn)
         : ReadTransaction(storage, txn), txMgr(txMgr) {
-        MergeValue put;
-        put.action = PUT;
-        put.txId = txn->GetTxId();
-        putEnc = encoding().put_merge(put);
-        MergeValue del;
-        del.action = DELETE;
-        del.txId = txn->GetTxId();
-        delEnc = encoding().put_merge(del);
+        storage::ItemOperation put;
+        put.set_action(storage::PUT);
+        put.set_txid(txn->GetTxId());
+        putSlice = put.SerializeAsString();
+
+        storage::ItemOperation del;
+        del.set_action(storage::DELETE);
+        del.set_txid(txn->GetTxId());
+        delSlice = del.SerializeAsString();
     }
 
     virtual bool IsReadOnly() { return false; }
@@ -356,17 +357,17 @@ private:
     }
 
     void Put(rocksdb::ColumnFamilyHandle *handle, WriteContext &ctx, const rocksdb::Slice &key) const {
-        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, putEnc.ToSlice());
+        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, putSlice);
         assert(status.ok());
     }
 
     void Delete(rocksdb::ColumnFamilyHandle *handle, WriteContext &ctx, const rocksdb::Slice &key) const {
-        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, delEnc.ToSlice());
+        rocksdb::Status status = ctx.wb.Merge(handle, key, ctx.ts, delSlice);
         assert(status.ok());
     }
 
-    encoding putEnc;
-    encoding delEnc;
+    std::string putSlice;
+    std::string delSlice;
     std::shared_ptr<TransactionManager> txMgr;
 };
 

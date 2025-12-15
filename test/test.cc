@@ -49,7 +49,7 @@ void testLocal() {
         std::unique_ptr<WriteTransaction> addEdge(graph.OpenForWrite(edgeCtx));
         addEdge->AddVertex(otherId, edgeCtx);
         addEdge->AddEdge("peer", vertexId, otherId, edgeCtx);
-            addEdge->Commit(edgeCtx);
+        addEdge->Commit(edgeCtx);
         addEdgeTx = addEdge->GetTxId();
     }
 

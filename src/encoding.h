@@ -93,21 +93,6 @@ public:
         return *this;
     }
 
-    encoding &get_merge(MergeValue &out) {
-        nuraft::byte byte = buffer->get_byte();
-        out.action = byte == '\0' ? PUT : DELETE;
-        out.txId = buffer->get_ulong();
-        return *this;
-    }
-
-    encoding &put_merge(const MergeValue &value) {
-        grow(sizeof(ulong) + 1);
-        nuraft::byte b = value.action == PUT ? '\0' : '\1';
-        buffer->put(b);
-        buffer->put(value.txId);
-        return *this;
-    }
-
     const rocksdb::Slice ToSlice() const {
         return rocksdb::Slice(reinterpret_cast<const char *>(buffer->data_begin()), buffer->pos());
     }

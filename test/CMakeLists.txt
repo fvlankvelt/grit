@@ -32,12 +32,22 @@ function(unit_test)
     )
 endfunction()
 
-unit_test(NAME test_edge
+unit_test(NAME basic_test
         SOURCES
-        test.cc
+        basic_test.cc
+)
+
+unit_test(NAME transaction_test
+        SOURCES
+        transaction_test.cc
+)
+
+unit_test(NAME storage_test
+        SOURCES
+        storage_test.cc
 )
 
 unit_test(NAME test_performance
         SOURCES
-        test_performance.cc
+        performance_test.cc
 )

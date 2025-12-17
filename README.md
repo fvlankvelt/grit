@@ -11,14 +11,20 @@ A vertex is modelled as a single key with a `<type>`, with labels and (incoming,
 An index entry is very similar to a vertex itself.  The vertices with its label are stored as edges - letting us find the vertices for a particular label.
 
 To prevent transactional conflicts, edges in indices are stored as separate keys:
+```
     index:<label>:<type>:<vertex_id> => [Add @ ts] | [Remove @ ts]
+```
 An index lookup is then an iterator over a prefix.  A seek to `<label>:` can then be followed by an iteration that stops when the prefix no longer matches.
 
 Labels for vertices are modeled as a set, stored in a column family:
+```
   labels:<type>:<vertex_id>:<label> => [Add @ ts] | [Remove @ ts]
+```
 
 Edges in vertices are stored in a column family with both vertex keys (so they are persisted twice - once with direction `in` and once with direction `out`):
+```
   edges:<type>:<vertex_id>:<edge_label>:<direction>:<target_type>:<vertex_id'> => [Add @ ts] | [Remove @ ts']
+```
 
 The complete set of edges is reconstructed by a scan/iterator with on the column family.
 

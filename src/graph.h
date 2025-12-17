@@ -521,9 +521,10 @@ private:
             value.ParseFromString(upstream->value().ToString());
             const rocksdb::Slice &currentKey = upstream->key();
             if (value.action() == storage::PUT || value.putsinprogress_size() > 0) {
-                ctx.wb.Put(cf, currentKey, upstream->value().ToString());
+                // TODO: only PUT when number of updates passes a threshold?
+                ctx.wb.Put(cf, currentKey, ctx.ts, upstream->value().ToString());
             } else {
-                ctx.wb.Delete(cf, currentKey);
+                ctx.wb.Delete(cf, currentKey, ctx.ts);
             }
             upstream->Next();
         }
@@ -537,16 +538,17 @@ public:
     explicit Graph(const Storage &storage) : txMgr(storage.GetTransactionManager()), storage(storage) {
     }
 
-    ReadTransaction *OpenForRead(uint64_t txId = 0) {
-        return new ReadTransaction(storage, txMgr->OpenForRead(txId));
+    std::shared_ptr<ReadTransaction> OpenForRead(uint64_t txId = 0) {
+        return std::make_shared<ReadTransaction>(storage, txMgr->OpenForRead(txId));
     }
 
-    WriteTransaction *OpenForWrite(WriteContext &ctx) {
-        return new WriteTransaction(storage, txMgr, txMgr->OpenForWrite(ctx));
+    std::shared_ptr<WriteTransaction> OpenForWrite(WriteContext &ctx) {
+        return std::make_shared<WriteTransaction>(storage, txMgr, txMgr->OpenForWrite(ctx));
     }
 
-    Slicer *OpenSlicer(WriteContext &ctx) {
-        return new Slicer(storage);
+    std::shared_ptr<Slicer> OpenSlicer(WriteContext& ctx) {
+        txMgr->OpenSlicer(ctx);
+        return std::make_shared<Slicer>(storage);
     }
 
     friend class StateMachine;

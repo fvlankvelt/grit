@@ -103,7 +103,6 @@ public:
             existingState.ParseFromString(strValue);
 
             // one of the in-progress transactions may have committed since the snapshot was created
-            action = existingState.action();
             for (const auto &txId: existingState.putsinprogress()) {
                 if (context->IsExcluded(txId)) {
                     state.add_putsinprogress(txId);
@@ -124,7 +123,12 @@ public:
                     action = storage::DELETE;
                 }
             }
+            if (!found) {
+                found = true;
+                action = existingState.action();
+            }
         }
+
 
         state.set_action(action);
         merge_out->new_value = state.SerializeAsString();

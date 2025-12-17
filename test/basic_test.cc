@@ -2,7 +2,7 @@
 
 #include "graph.h"
 
-void testLocal() {
+void BasicTest() {
     std::filesystem::remove_all("/tmp/graphdb");
     Storage storage("/tmp/graphdb");
 
@@ -14,7 +14,7 @@ void testLocal() {
     uint64_t createVertexTx;
     {
         WriteContext ctx(storage.db, log_idx);
-        std::unique_ptr<WriteTransaction> createVertex(graph.OpenForWrite(ctx));
+        std::shared_ptr<WriteTransaction> createVertex(graph.OpenForWrite(ctx));
         createVertex->AddVertex(vertexId, ctx);
         createVertex->AddLabel(vertexId, "ye-label", ctx);
         createVertex->Commit(ctx);
@@ -27,7 +27,7 @@ void testLocal() {
         expected.insert("c:1");
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead());
         std::shared_ptr vertices(
             read->GetVerticesByLabel("ye-label", "c"));
         while (vertices->Valid()) {
@@ -46,7 +46,7 @@ void testLocal() {
     uint64_t addEdgeTx;
     {
         WriteContext edgeCtx(storage.db, log_idx++);
-        std::unique_ptr<WriteTransaction> addEdge(graph.OpenForWrite(edgeCtx));
+        std::shared_ptr<WriteTransaction> addEdge(graph.OpenForWrite(edgeCtx));
         addEdge->AddVertex(otherId, edgeCtx);
         addEdge->AddEdge("peer", vertexId, otherId, edgeCtx);
         addEdge->Commit(edgeCtx);
@@ -59,7 +59,7 @@ void testLocal() {
         expected.insert("c:2");
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead());
         std::shared_ptr edges(read->GetEdges(vertexId, "peer", OUT));
         while (edges->Valid()) {
             const Edge &edge = edges->Get();
@@ -78,7 +78,7 @@ void testLocal() {
         expected.insert("c:1");
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(createVertexTx));
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead(createVertexTx));
         std::shared_ptr bytype(read->GetVerticesByType("c"));
         while (bytype->Valid()) {
             const VertexId &id = bytype->Get();
@@ -93,7 +93,7 @@ void testLocal() {
 
     {
         WriteContext removeEdgeCtx(storage.db, log_idx++);
-        std::unique_ptr<WriteTransaction> removeEdge(graph.OpenForWrite(removeEdgeCtx));
+        std::shared_ptr<WriteTransaction> removeEdge(graph.OpenForWrite(removeEdgeCtx));
         removeEdge->RemoveEdge("peer", vertexId, otherId, removeEdgeCtx);
         removeEdge->Commit(removeEdgeCtx);
     }
@@ -104,7 +104,7 @@ void testLocal() {
         expected.insert("c:2");
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead(addEdgeTx));
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead(addEdgeTx));
         std::shared_ptr edges(read->GetEdges(vertexId, "peer", OUT));
         while (edges->Valid()) {
             const Edge &edge = edges->Get();
@@ -122,7 +122,7 @@ void testLocal() {
         std::set<std::string> expected;
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead());
         std::shared_ptr edges(read->GetEdges(vertexId, "peer", OUT));
         while (edges->Valid()) {
             const Edge &edge = edges->Get();
@@ -137,7 +137,7 @@ void testLocal() {
 
     {
         WriteContext rollbackCtx(storage.db, log_idx++);
-        std::unique_ptr<WriteTransaction> addEdgeRollback(graph.OpenForWrite(rollbackCtx));
+        std::shared_ptr<WriteTransaction> addEdgeRollback(graph.OpenForWrite(rollbackCtx));
         addEdgeRollback->AddEdge("peer", vertexId, otherId, rollbackCtx);
         addEdgeRollback->Rollback(rollbackCtx);
     }
@@ -147,7 +147,7 @@ void testLocal() {
         std::set<std::string> expected;
 
         std::set<std::string> found;
-        std::unique_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::shared_ptr<ReadTransaction> read(graph.OpenForRead());
         std::shared_ptr edges(read->GetEdges(vertexId, "peer", OUT));
         while (edges->Valid()) {
             const Edge &edge = edges->Get();
@@ -162,5 +162,5 @@ void testLocal() {
 }
 
 int main() {
-    testLocal();
+    BasicTest();
 }

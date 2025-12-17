@@ -13,17 +13,19 @@
 #include <rocksdb/write_batch.h>
 
 #include "model.h"
+#include "encoding.h"
 #include "storage.pb.h"
 
 enum TransactionException { TX_IS_READONLY, TX_CONFLICT, TX_INVALIDATED, TX_NOT_IN_PROGRESS };
 
 class WriteContext {
 public:
-    explicit WriteContext(rocksdb::DB * db, uint64_t log_idx)
+    explicit WriteContext(rocksdb::DB *db, uint64_t log_idx)
         : db(db), raft_log_idx(log_idx), wb(rocksdb::WriteBatch()) {
         ts = rocksdb::EncodeU64Ts(log_idx, &tsStr);
     }
-    WriteContext(const WriteContext&) = delete;
+
+    WriteContext(const WriteContext &) = delete;
 
     ~WriteContext() {
         db->Write(rocksdb::WriteOptions(), &wb);
@@ -34,7 +36,7 @@ public:
     rocksdb::Slice ts;
 
 private:
-    rocksdb::DB * db;
+    rocksdb::DB *db;
     std::string tsStr;
 };
 
@@ -45,13 +47,14 @@ public:
 
     virtual bool IsExcluded(uint64_t otherTxId) const = 0;
 
-    static std::shared_ptr<ItemStateContext> Get(const std::shared_ptr<ItemStateContext>& defaultContext) {
+    static std::shared_ptr<ItemStateContext> Get(const std::shared_ptr<ItemStateContext> &defaultContext) {
         return threadContext == nullptr ? defaultContext : threadContext;
     }
 
-    static void Set(const std::shared_ptr<ItemStateContext>& context) {
+    static void Set(const std::shared_ptr<ItemStateContext> &context) {
         threadContext = context;
     }
+
 private:
     inline static thread_local std::shared_ptr<ItemStateContext> threadContext;
 };
@@ -128,19 +131,21 @@ public:
             std::stringstream ss;
             ss << "tx:" << txId;
             std::string value;
-            auto status = db->Get(options, ss.str(), &value);
-            assert(status.ok());
-
-            storage::Transaction tx;
-            tx.ParseFromString(value);
-            std::set<VertexId> touched;
-            auto vertex_keys = tx.touched();
-            for (auto &vertex_key: vertex_keys) {
-                VertexId vid;
-                encoding(vertex_key).get_vertex(vid);
-                touched.insert(vid);
+            auto status = db->Get(options, tx_cf,ss.str(), &value);
+            if (status.ok()) {
+                storage::Transaction tx;
+                tx.ParseFromString(value);
+                std::set<VertexId> touched;
+                auto vertex_keys = tx.touched();
+                for (auto &vertex_key: vertex_keys) {
+                    VertexId vid;
+                    encoding(vertex_key).get_vertex(vid);
+                    touched.insert(vid);
+                }
+                recent.insert(std::pair(txId, touched));
+            } else {
+                recent.insert(std::pair(txId, std::set<VertexId>()));
             }
-            recent.insert(std::pair(txId, touched));
         }
 
         ulong last_log_idx;
@@ -187,6 +192,11 @@ public:
         return tx;
     }
 
+    void OpenSlicer(WriteContext &ctx) {
+        std::unique_lock db_lock(db_mutex);
+        readLastLogIdx = ctx.raft_log_idx;
+    }
+
     std::shared_ptr<Transaction> GetWriteTxn(uint64_t txId) {
         std::shared_lock db_lock(db_mutex);
         auto found = inProgress.find(txId);
@@ -227,8 +237,7 @@ public:
                     // expired already.  So we cannot check if it conflicts.
                     throw TX_INVALIDATED;
                 } else {
-                    const std::set<VertexId> ref = recent.find(inPTxId)->second;
-                    if (Conflict(ref, txn.touched)) {
+                    if (const std::set<VertexId>& ref = recent.find(inPTxId)->second; Conflict(ref, txn.touched)) {
                         throw TX_CONFLICT;
                     }
                 }

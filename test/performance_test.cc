@@ -8,7 +8,7 @@
 
 using namespace std;
 
-int main() {
+void TestPerformance() {
     std::filesystem::remove_all("/tmp/graphdb");
     Storage storage("/tmp/graphdb");
 
@@ -69,4 +69,8 @@ int main() {
     duration = index_queried - sliced;
     std::cout << "Queried " << num_results << " vertices in " << N_BATCHES << " queries: " << duration / N_BATCHES <<
             " per query" << std::endl;
+}
+
+int main() {
+    TestPerformance();
 }

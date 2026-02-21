@@ -116,8 +116,8 @@ message GetVerticesByTypeRequest {
 
 message GetVerticesByLabelRequest {
   uint64 txId = 1;
-  string label = 2;
-  string type = 3;
+  string type = 2;
+  repeated string labels = 3;
 }
 
 message GetLabelsRequest {

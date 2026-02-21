@@ -188,20 +188,15 @@ class Service : public api::GritApi::Service {
         const api::GetEdgesRequest* request,
         grpc::ServerWriter<api::Edge>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        bool first = false;
-        api::Edge out;
-        for (auto it = request->vertices().begin(); it != request->vertices().end(); it++) {
-            VertexId vertexId = {it->type(), it->id()};
-            if (!first) {
-                writer->Write(out);
-            }
-            first = WriteIterator<Edge, api::Edge>(
-                writer, txn->GetEdges(vertexId), convertEdge, out);
-        }
-        if (!first) {
-            writer->WriteLast(out, grpc::WriteOptions());
-        }
-        return grpc::Status::OK;
+        return WriteMultiIterator<api::VertexId, Edge, api::Edge>(
+            writer,
+            request->vertices(),
+            [txn,
+             request](const api::VertexId& vertexId) -> std::shared_ptr<EntryIterator<Edge>> {
+                VertexId id = {vertexId.type(), vertexId.id()};
+                return txn->GetEdges(id);
+            },
+            convertEdge);
     }
 
     grpc::Status GetEdgesByLabel(
@@ -209,24 +204,16 @@ class Service : public api::GritApi::Service {
         const api::GetEdgesByLabelRequest* request,
         grpc::ServerWriter<api::Edge>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        bool first = false;
-        api::Edge out;
-        for (auto it = request->vertices().begin(); it != request->vertices().end(); it++) {
-            VertexId vertexId = {it->type(), it->id()};
-            if (!first) {
-                writer->Write(out);
-            }
-            first = WriteIterator<Edge, api::Edge>(
-                writer,
-                txn->GetEdges(
-                    vertexId, request->label(), request->direction() == api::IN ? IN : OUT),
-                convertEdge,
-                out);
-        }
-        if (!first) {
-            writer->WriteLast(out, grpc::WriteOptions());
-        }
-        return grpc::Status::OK;
+        return WriteMultiIterator<api::VertexId, Edge, api::Edge>(
+            writer,
+            request->vertices(),
+            [txn,
+             request](const api::VertexId& vertexId) -> std::shared_ptr<EntryIterator<Edge>> {
+                VertexId id = {vertexId.type(), vertexId.id()};
+                return txn->GetEdges(
+                    id, request->label(), request->direction() == api::IN ? IN : OUT);
+            },
+            convertEdge);
     }
 
     grpc::Status GetVerticesByType(
@@ -243,8 +230,14 @@ class Service : public api::GritApi::Service {
         const api::GetVerticesByLabelRequest* request,
         grpc::ServerWriter<api::VertexId>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        return WriteItems<VertexId, api::VertexId>(
-            writer, txn->GetVerticesByLabel(request->label(), request->type()), convertVertex);
+        return WriteMultiIterator<std::string, VertexId, api::VertexId>(
+            writer,
+            request->labels(),
+            [txn,
+             request](const std::string& label) -> std::shared_ptr<EntryIterator<VertexId>> {
+                return txn->GetVerticesByLabel(label, request->type());
+            },
+            convertVertex);
     }
 
    private:
@@ -276,7 +269,7 @@ class Service : public api::GritApi::Service {
     template <class D, class A>
     static grpc::Status WriteItems(
         grpc::ServerWriter<A>* writer,
-        std::shared_ptr<EntryIterator<D> > items,
+        std::shared_ptr<EntryIterator<D>> items,
         std::function<void(const D&, A&)> convert) {
         grpc::WriteOptions wo;
         A out;
@@ -287,10 +280,30 @@ class Service : public api::GritApi::Service {
         return grpc::Status::OK;
     }
 
+    template <class K, class D, class A>
+    static grpc::Status WriteMultiIterator(
+        grpc::ServerWriter<A>* writer,
+        const google::protobuf::RepeatedPtrField<K>& field,
+        std::function<std::shared_ptr<EntryIterator<D>>(const K&)> to_iter,
+        std::function<void(const D&, A&)> convert) {
+        A out;
+        bool first = false;
+        for (auto it = field.begin(); it != field.end(); it++) {
+            if (!first) {
+                writer->Write(out);
+            }
+            first = WriteIterator<D, A>(writer, to_iter(*it), convert, out);
+        }
+        if (!first) {
+            writer->WriteLast(out, grpc::WriteOptions());
+        }
+        return grpc::Status::OK;
+    }
+
     template <class D, class A>
     static bool WriteIterator(
         grpc::ServerWriter<A>* writer,
-        std::shared_ptr<EntryIterator<D> > items,
+        std::shared_ptr<EntryIterator<D>> items,
         std::function<void(const D&, A&)> convert,
         A& out) {
         D item;

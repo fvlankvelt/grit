@@ -26,7 +26,7 @@ RUN zypper update -y \
     librocksdb10 \
     libgrpc++1_76 \
     abseil-cpp-devel \
-    libssl59
+    libssl60
 WORKDIR /app
 COPY --from=builder /build/Grit /app
 CMD ["/app/Grit"]

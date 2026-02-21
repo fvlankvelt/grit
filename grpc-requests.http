@@ -1,5 +1,5 @@
 ### open transaction
-GRPC localhost:8081/api.GritApi/OpenTransaction
+GRPC localhost:8001/api.GritApi/OpenTransaction
 
 {
   "type": "WRITE"
@@ -7,7 +7,7 @@ GRPC localhost:8081/api.GritApi/OpenTransaction
 
 ### add vertex
 
-GRPC localhost:8083/api.GritApi/AddVertex
+GRPC localhost:8003/api.GritApi/AddVertex
 
 {
   "txId": "2",
@@ -22,7 +22,7 @@ GRPC localhost:8083/api.GritApi/AddVertex
 GRPC localhost:8002/api.GritApi/AddVertex
 
 {
-  "txId": "1",
+  "txId": "2",
   "vertexId": {
     "type": "comp",
     "id": 1234
@@ -34,7 +34,7 @@ GRPC localhost:8002/api.GritApi/AddVertex
 GRPC localhost:8001/api.GritApi/AddEdge
 
 {
-  "txId": "1",
+  "txId": "2",
   "label": "ye-vertex",
   "fromVertexId": {
     "type": "comp",
@@ -48,7 +48,7 @@ GRPC localhost:8001/api.GritApi/AddEdge
 
 ### open read tx
 
-GRPC localhost:8083/api.GritApi/OpenTransaction
+GRPC localhost:8003/api.GritApi/OpenTransaction
 
 {
   "type": "READ"
@@ -59,7 +59,7 @@ GRPC localhost:8083/api.GritApi/OpenTransaction
 GRPC localhost:8002/api.GritApi/GetVerticesByType
 
 {
-  "txId": "2",
+  "txId": "3",
   "type": "comp"
 }
 
@@ -68,7 +68,7 @@ GRPC localhost:8002/api.GritApi/GetVerticesByType
 GRPC localhost:8001/api.GritApi/Commit
 
 {
-  "txId": "1"
+  "txId": "2"
 }
 
 ### open read tx after commit
@@ -84,16 +84,16 @@ GRPC localhost:8002/api.GritApi/OpenTransaction
 GRPC localhost:8002/api.GritApi/GetVerticesByType
 
 {
-  "txId": "3",
+  "txId": "4",
   "type": "comp"
 }
 
 ### read vertices in original snapshot
 
-GRPC localhost:8002/api.GritApi/GetVerticesByType
+GRPC localhost:8001/api.GritApi/GetVerticesByType
 
 {
-  "txId": "2",
+  "txId": "3",
   "type": "comp"
 }
 

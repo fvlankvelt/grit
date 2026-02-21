@@ -127,14 +127,14 @@ message GetLabelsRequest {
 
 message GetEdgesRequest {
   uint64 txId = 1;
-  VertexId vertexId = 2;
+  repeated VertexId vertices = 2;
 }
 
 message GetEdgesByLabelRequest {
   uint64 txId = 1;
-  VertexId vertexId = 2;
-  string label = 3;
-  EdgeDirection direction = 4;
+  string label = 2;
+  EdgeDirection direction = 3;
+  repeated VertexId vertices = 4;
 }
 
 // internal, but uses same messages as api

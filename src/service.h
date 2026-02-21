@@ -7,24 +7,24 @@
 
 #include "api.grpc.pb.h"
 #include "graph.h"
-#include "state_machine.h"
-
 #include "in_memory_state_mgr.hxx"
 #include "libnuraft/nuraft.hxx"
+#include "state_machine.h"
 
 using namespace nuraft;
 
 class Logger : public logger {
-public:
-    void put_details(int level,
-                     const char *source_file,
-                     const char *func_name,
-                     size_t line_number,
-                     const std::string &msg) {
+   public:
+    void put_details(
+        int level,
+        const char* source_file,
+        const char* func_name,
+        size_t line_number,
+        const std::string& msg) {
         // INFO logging
         if (level <= 4) {
-            std::cout << level << ": " << source_file << " :" << func_name << " (" << line_number << "): " << msg <<
-                    std::endl;
+            std::cout << level << ": " << source_file << " :" << func_name << " ("
+                      << line_number << "): " << msg << std::endl;
         }
     }
 };
@@ -35,13 +35,14 @@ struct RaftPeer {
 };
 
 class Service : public api::GritApi::Service {
-public:
-    Service(int id, int raftPort, const ptr<Graph> &graph, std::vector<RaftPeer> peers) : graph(graph) {
+   public:
+    Service(int id, int raftPort, const ptr<Graph>& graph, std::vector<RaftPeer> peers)
+        : graph(graph) {
         ptr<logger> my_logger = cs_new<Logger>();
-        ptr<state_mgr> my_state_manager = cs_new<inmem_state_mgr>(id, "localhost:" +
-                                                                      std::to_string(raftPort));
+        ptr<state_mgr> my_state_manager =
+            cs_new<inmem_state_mgr>(id, "localhost:" + std::to_string(raftPort));
         auto cluster_config = my_state_manager->load_config();
-        for (auto &peer: peers) {
+        for (auto& peer : peers) {
             ptr<srv_config> peer_conf = cs_new<srv_config>(peer.id, peer.address);
             cluster_config->get_servers().push_back(peer_conf);
         }
@@ -53,22 +54,20 @@ public:
 
         my_state_machine_ = cs_new<StateMachine>(graph);
         launcher_ = cs_new<raft_launcher>();
-        server_ = launcher_->init(my_state_machine_, my_state_manager, my_logger, raftPort,
-                                  asio_opt, params);
+        server_ = launcher_->init(
+            my_state_machine_, my_state_manager, my_logger, raftPort, asio_opt, params);
 
         while (!server_->is_initialized()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
-    ~Service() override {
-        launcher_->shutdown();
-    }
+    ~Service() override { launcher_->shutdown(); }
 
     grpc::Status OpenTransaction(
-        grpc::ServerContext *context,
-        const api::OpenRequest *request,
-        api::Transaction *response) override {
+        grpc::ServerContext* context,
+        const api::OpenRequest* request,
+        api::Transaction* response) override {
         // There is no need to go through raft for opening a read transaction
         // No mutations are needed.
         if (request->type() == api::READ) {
@@ -92,155 +91,180 @@ public:
     }
 
     grpc::Status Commit(
-        grpc::ServerContext *context,
-        const api::Transaction *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::Transaction* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
         entry.mutable_commit()->CopyFrom(*request);
         return Submit(entry, response);
     }
 
     grpc::Status Rollback(
-        grpc::ServerContext *context,
-        const api::Transaction *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::Transaction* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_rollback()->CopyFrom(*request);;
+        entry.mutable_rollback()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     // write operations
     grpc::Status AddVertex(
-        grpc::ServerContext *context,
-        const api::AddVertexRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::AddVertexRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_addvertex()->CopyFrom(*request);;
+        entry.mutable_addvertex()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     grpc::Status RemoveVertex(
-        grpc::ServerContext *context,
-        const api::RemoveVertexRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::RemoveVertexRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_removevertex()->CopyFrom(*request);;
+        entry.mutable_removevertex()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     grpc::Status AddLabel(
-        grpc::ServerContext *context,
-        const api::AddLabelRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::AddLabelRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_addlabel()->CopyFrom(*request);;
+        entry.mutable_addlabel()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     grpc::Status RemoveLabel(
-        grpc::ServerContext *context,
-        const api::RemoveLabelRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::RemoveLabelRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_removelabel()->CopyFrom(*request);;
+        entry.mutable_removelabel()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     grpc::Status AddEdge(
-        grpc::ServerContext *context,
-        const api::AddEdgeRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::AddEdgeRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_addedge()->CopyFrom(*request);;
+        entry.mutable_addedge()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     grpc::Status RemoveEdge(
-        grpc::ServerContext *context,
-        const api::RemoveEdgeRequest *request,
-        api::TransactionResponse *response) override {
+        grpc::ServerContext* context,
+        const api::RemoveEdgeRequest* request,
+        api::TransactionResponse* response) override {
         api::RaftLogEntry entry;
-        entry.mutable_removeedge()->CopyFrom(*request);;
+        entry.mutable_removeedge()->CopyFrom(*request);
+        ;
         return Submit(entry, response);
     }
 
     // read operations
     grpc::Status GetLabels(
-        grpc::ServerContext *context,
-        const api::GetLabelsRequest *request,
-        grpc::ServerWriter<api::Label> *writer) override {
+        grpc::ServerContext* context,
+        const api::GetLabelsRequest* request,
+        grpc::ServerWriter<api::Label>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
         VertexId vertexId = {request->vertexid().type(), request->vertexid().id()};
-        return WriteItems<std::string, api::Label>(writer, txn->GetLabels(vertexId),
-                                                   [](const std::string &label, api::Label &out) {
-                                                       out.set_label(label);
-                                                   });
-    }
-
-    grpc::Status GetEdges(
-        grpc::ServerContext *context,
-        const api::GetEdgesRequest *request,
-        grpc::ServerWriter<api::Edge> *writer) override {
-        ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        VertexId vertexId = {request->vertexid().type(), request->vertexid().id()};
-        return WriteItems<Edge, api::Edge>(writer, txn->GetEdges(vertexId), [](const Edge &edge, api::Edge &out) {
-            out.set_label(edge.label);
-            out.set_direction(edge.direction == IN ? api::IN : api::OUT);
-            auto vertex_id = out.mutable_vertexid();
-            vertex_id->set_type(edge.vertexId.type);
-            vertex_id->set_id(edge.vertexId.id);
-            auto other_id = out.mutable_otherid();
-            other_id->set_type(edge.otherId.type);
-            other_id->set_id(edge.otherId.id);
-        });
-    }
-
-    grpc::Status GetEdgesByLabel(
-        grpc::ServerContext *context,
-        const api::GetEdgesByLabelRequest *request,
-        grpc::ServerWriter<api::Edge> *writer) override {
-        ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        VertexId vertexId = {request->vertexid().type(), request->vertexid().id()};
-        return WriteItems<Edge, api::Edge>(
-            writer, txn->GetEdges(vertexId, request->label(), request->direction() == api::IN ? IN : OUT), [
-            ](const Edge &edge, api::Edge &out) {
-                out.set_label(edge.label);
-                out.set_direction(edge.direction == IN ? api::IN : api::OUT);
-                auto vertex_id = out.mutable_vertexid();
-                vertex_id->set_type(edge.vertexId.type);
-                vertex_id->set_id(edge.vertexId.id);
-                auto other_id = out.mutable_otherid();
-                other_id->set_type(edge.otherId.type);
-                other_id->set_id(edge.otherId.id);
+        return WriteItems<std::string, api::Label>(
+            writer, txn->GetLabels(vertexId), [](const std::string& label, api::Label& out) {
+                out.set_label(label);
             });
     }
 
-    grpc::Status GetVerticesByType(
-        grpc::ServerContext *context,
-        const api::GetVerticesByTypeRequest *request,
-        grpc::ServerWriter<api::VertexId> *writer) override {
+    grpc::Status GetEdges(
+        grpc::ServerContext* context,
+        const api::GetEdgesRequest* request,
+        grpc::ServerWriter<api::Edge>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        return WriteItems<VertexId, api::VertexId>(writer, txn->GetVerticesByType(request->type()),
-                                                   [](const VertexId &vertexId, api::VertexId &out) {
-                                                       out.set_type(vertexId.type);
-                                                       out.set_id(vertexId.id);
-                                                   });
+        bool first = false;
+        api::Edge out;
+        for (auto it = request->vertices().begin(); it != request->vertices().end(); it++) {
+            VertexId vertexId = {it->type(), it->id()};
+            if (!first) {
+                writer->Write(out);
+            }
+            first = WriteIterator<Edge, api::Edge>(
+                writer, txn->GetEdges(vertexId), convertEdge, out);
+        }
+        if (!first) {
+            writer->WriteLast(out, grpc::WriteOptions());
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status GetEdgesByLabel(
+        grpc::ServerContext* context,
+        const api::GetEdgesByLabelRequest* request,
+        grpc::ServerWriter<api::Edge>* writer) override {
+        ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
+        bool first = false;
+        api::Edge out;
+        for (auto it = request->vertices().begin(); it != request->vertices().end(); it++) {
+            VertexId vertexId = {it->type(), it->id()};
+            if (!first) {
+                writer->Write(out);
+            }
+            first = WriteIterator<Edge, api::Edge>(
+                writer,
+                txn->GetEdges(
+                    vertexId, request->label(), request->direction() == api::IN ? IN : OUT),
+                convertEdge,
+                out);
+        }
+        if (!first) {
+            writer->WriteLast(out, grpc::WriteOptions());
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status GetVerticesByType(
+        grpc::ServerContext* context,
+        const api::GetVerticesByTypeRequest* request,
+        grpc::ServerWriter<api::VertexId>* writer) override {
+        ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
+        return WriteItems<VertexId, api::VertexId>(
+            writer, txn->GetVerticesByType(request->type()), convertVertex);
     }
 
     grpc::Status GetVerticesByLabel(
-        grpc::ServerContext *context,
-        const api::GetVerticesByLabelRequest *request,
-        grpc::ServerWriter<api::VertexId> *writer) override {
+        grpc::ServerContext* context,
+        const api::GetVerticesByLabelRequest* request,
+        grpc::ServerWriter<api::VertexId>* writer) override {
         ptr<ReadTransaction> txn(graph->OpenForRead(request->txid()));
-        return WriteItems<VertexId, api::VertexId>(writer, txn->GetVerticesByLabel(request->label(), request->type()),
-                                                   [](const VertexId &vertexId, api::VertexId &out) {
-                                                       out.set_type(vertexId.type);
-                                                       out.set_id(vertexId.id);
-                                                   });
+        return WriteItems<VertexId, api::VertexId>(
+            writer, txn->GetVerticesByLabel(request->label(), request->type()), convertVertex);
     }
 
-private:
-    grpc::Status Submit(const api::RaftLogEntry &entry, api::TransactionResponse *response) {
+   private:
+    static void convertVertex(const VertexId& vertexId, api::VertexId& out) {
+        out.set_type(vertexId.type);
+        out.set_id(vertexId.id);
+    }
+
+    static void convertEdge(const Edge& edge, api::Edge& out) {
+        out.set_label(edge.label);
+        out.set_direction(edge.direction == IN ? api::IN : api::OUT);
+        auto vertex_id = out.mutable_vertexid();
+        vertex_id->set_type(edge.vertexId.type);
+        vertex_id->set_id(edge.vertexId.id);
+        auto other_id = out.mutable_otherid();
+        other_id->set_type(edge.otherId.type);
+        other_id->set_id(edge.otherId.id);
+    }
+
+    grpc::Status Submit(const api::RaftLogEntry& entry, api::TransactionResponse* response) {
         auto cmd_result = server_->append_entries({WriteBuffer(entry)});
         if (cmd_result->get_result_code() == OK && cmd_result->has_result()) {
             ReadBuffer(*response, *cmd_result->get());
@@ -249,30 +273,39 @@ private:
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "Service unavailable");
     }
 
-    template<class D, class A>
+    template <class D, class A>
     static grpc::Status WriteItems(
-        grpc::ServerWriter<A> *writer,
-        std::shared_ptr<EntryIterator<D> > items, std::function<void(const D &, A &)> convert) {
+        grpc::ServerWriter<A>* writer,
+        std::shared_ptr<EntryIterator<D> > items,
+        std::function<void(const D&, A&)> convert) {
         grpc::WriteOptions wo;
+        A out;
+        bool first = WriteIterator(writer, items, convert, out);
+        if (!first) {
+            writer->WriteLast(out, wo);
+        }
+        return grpc::Status::OK;
+    }
+
+    template <class D, class A>
+    static bool WriteIterator(
+        grpc::ServerWriter<A>* writer,
+        std::shared_ptr<EntryIterator<D> > items,
+        std::function<void(const D&, A&)> convert,
+        A& out) {
         D item;
         bool first = true;
         while (items->Valid()) {
             if (first) {
                 first = false;
             } else {
-                A out;
-                convert(item, out);
-                writer->Write(out, wo);
+                writer->Write(out);
             }
             item = items->Get();
+            convert(item, out);
             items->Next();
         }
-        if (!first) {
-            A out;
-            convert(item, out);
-            writer->WriteLast(out, wo);
-        }
-        return grpc::Status::OK;
+        return first;
     }
 
     ptr<raft_server> server_;
@@ -291,11 +324,16 @@ inline void signalHandler(int signum) {
     }
 }
 
-inline void RunServer(int grpcPort, int raftPort, int raftId, std::vector<RaftPeer> peers,
-                      const std::string &storagePath) {
+inline void RunServer(
+    int grpcPort,
+    int raftPort,
+    int raftId,
+    std::vector<RaftPeer> peers,
+    const std::string& storagePath) {
     Storage storage(storagePath);
     std::string server_address("0.0.0.0:" + std::to_string(grpcPort));
-    api::GritApi::Service *service = new Service(raftId, raftPort, cs_new<Graph>(storage), peers);
+    api::GritApi::Service* service =
+        new Service(raftId, raftPort, cs_new<Graph>(storage), peers);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());

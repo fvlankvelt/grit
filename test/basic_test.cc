@@ -16,7 +16,7 @@ void BasicTest() {
         WriteContext ctx(storage.db, log_idx);
         std::shared_ptr<WriteTransaction> createVertex(graph.OpenForWrite(ctx));
         createVertex->AddVertex(vertexId, ctx);
-        createVertex->AddLabel(vertexId, "ye-label", ctx);
+        createVertex->AddLabel(vertexId, "key:ye-label", ctx);
         createVertex->Commit(ctx);
         createVertexTx = createVertex->GetTxId();
     }
@@ -27,9 +27,9 @@ void BasicTest() {
         expected.insert("c:1");
 
         std::set<std::string> found;
-        std::shared_ptr<ReadTransaction> read(graph.OpenForRead());
+        std::shared_ptr read(graph.OpenForRead());
         std::shared_ptr vertices(
-            read->GetVerticesByLabel("ye-label", "c"));
+            read->GetVerticesByLabel("key:ye-label", "c"));
         while (vertices->Valid()) {
             const VertexId& id = vertices->Get();
             std::stringstream ss;

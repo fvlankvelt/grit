@@ -273,7 +273,8 @@ class Service : public api::GritApi::Service {
         std::function<void(const D&, A&)> convert) {
         grpc::WriteOptions wo;
         A out;
-        bool first = WriteIterator(writer, items, convert, out);
+        bool first = true;
+        WriteIterator(writer, items, convert, first, out);
         if (!first) {
             writer->WriteLast(out, wo);
         }
@@ -287,12 +288,9 @@ class Service : public api::GritApi::Service {
         std::function<std::shared_ptr<EntryIterator<D>>(const K&)> to_iter,
         std::function<void(const D&, A&)> convert) {
         A out;
-        bool first = false;
+        bool first = true;
         for (auto it = field.begin(); it != field.end(); it++) {
-            if (!first) {
-                writer->Write(out);
-            }
-            first = WriteIterator<D, A>(writer, to_iter(*it), convert, out);
+            WriteIterator<D, A>(writer, to_iter(*it), convert, first, out);
         }
         if (!first) {
             writer->WriteLast(out, grpc::WriteOptions());
@@ -301,13 +299,13 @@ class Service : public api::GritApi::Service {
     }
 
     template <class D, class A>
-    static bool WriteIterator(
+    static void WriteIterator(
         grpc::ServerWriter<A>* writer,
         std::shared_ptr<EntryIterator<D>> items,
         std::function<void(const D&, A&)> convert,
+        bool& first,
         A& out) {
         D item;
-        bool first = true;
         while (items->Valid()) {
             if (first) {
                 first = false;
@@ -318,7 +316,6 @@ class Service : public api::GritApi::Service {
             convert(item, out);
             items->Next();
         }
-        return first;
     }
 
     ptr<raft_server> server_;
